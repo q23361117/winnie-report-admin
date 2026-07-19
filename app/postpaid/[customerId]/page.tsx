@@ -5,6 +5,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   collection,
   doc,
+  getDocs,
   onSnapshot,
   query,
   runTransaction,
@@ -12,8 +13,9 @@ import {
   Timestamp,
   updateDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { db } from "@/lib/firebase";
 
 type Customer = {
@@ -73,8 +75,27 @@ function getTypeLabel(type: string) {
   return labels[type] ?? type;
 }
 
+
+function normalizeCustomerCode(value: string) {
+  return value.trim().replace(/\s+/g, "").toUpperCase();
+}
+
+async function sha256Hex(value: string) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function getCustomerDocumentId(customerCode: string) {
+  return (await sha256Hex(normalizeCustomerCode(customerCode))).slice(0, 40);
+}
+
 export default function PostpaidCustomerDetailPage() {
   const params = useParams<{ customerId: string }>();
+  const router = useRouter();
   const customerId = Array.isArray(params.customerId)
     ? params.customerId[0]
     : params.customerId;
@@ -82,6 +103,7 @@ export default function PostpaidCustomerDetailPage() {
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [editCustomerCode, setEditCustomerCode] = useState("");
   const [editName, setEditName] = useState("");
   const [editPhone, setEditPhone] = useState("");
   const [editLineUserId, setEditLineUserId] = useState("");
@@ -127,6 +149,7 @@ export default function PostpaidCustomerDetailPage() {
         };
 
         setCustomer(nextCustomer);
+        setEditCustomerCode(nextCustomer.customerCode);
         setEditName(nextCustomer.name);
         setEditPhone(nextCustomer.phone);
         setEditLineUserId(nextCustomer.lineUserId);
@@ -198,25 +221,146 @@ export default function PostpaidCustomerDetailPage() {
 
   async function saveCustomerProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!customerId) return;
+
+    if (!customerId || !customer) return;
+
+    const newCustomerCode = normalizeCustomerCode(editCustomerCode);
+    const oldCustomerCode = normalizeCustomerCode(customer.customerCode);
+
+    if (!newCustomerCode) {
+      setError("客戶代號不能留空。");
+      return;
+    }
 
     setSaving(true);
     setError("");
     setMessage("");
 
     try {
-      await updateDoc(doc(db, "postpaidCustomers", customerId), {
+      const profileData = {
+        customerCode: newCustomerCode,
         name: editName.trim(),
         phone: editPhone.trim(),
         lineUserId: editLineUserId.trim(),
         note: editNote.trim(),
         updatedAt: serverTimestamp(),
+      };
+
+      if (newCustomerCode === oldCustomerCode) {
+        await updateDoc(doc(db, "postpaidCustomers", customerId), profileData);
+        setMessage("客戶資料已更新。");
+        return;
+      }
+
+      const confirmed = window.confirm(
+        `確定要將客戶代號從「${customer.customerCode}」修改為「${newCustomerCode}」嗎？\n\n系統會保留餘額、LINE 綁定及歷史帳務。`
+      );
+
+      if (!confirmed) return;
+
+      const newCustomerId = await getCustomerDocumentId(newCustomerCode);
+      const oldCustomerRef = doc(db, "postpaidCustomers", customerId);
+      const newCustomerRef = doc(db, "postpaidCustomers", newCustomerId);
+
+      await runTransaction(db, async (transaction) => {
+        const oldSnapshot = await transaction.get(oldCustomerRef);
+        const newSnapshot = await transaction.get(newCustomerRef);
+
+        if (!oldSnapshot.exists()) {
+          throw new Error("原本的後結客戶資料已不存在。");
+        }
+
+        if (newSnapshot.exists() && newCustomerId !== customerId) {
+          throw new Error(`客戶代號「${newCustomerCode}」已經存在。`);
+        }
+
+        transaction.set(
+          newCustomerRef,
+          {
+            ...oldSnapshot.data(),
+            ...profileData,
+            customerCode: newCustomerCode,
+            previousCustomerCode: oldCustomerCode,
+            migratedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        if (newCustomerId !== customerId) {
+          transaction.delete(oldCustomerRef);
+        }
       });
 
-      setMessage("客戶資料已更新。");
+      const transactionSnapshot = await getDocs(
+        query(
+          collection(db, "postpaidTransactions"),
+          where("customerCode", "==", customer.customerCode)
+        )
+      );
+
+      const registrySnapshot = await getDocs(
+        query(
+          collection(db, "sheetPostpaidRides"),
+          where("customerCode", "==", customer.customerCode)
+        )
+      );
+
+      const pendingLineSnapshot = await getDocs(
+        query(
+          collection(db, "pendingLineUsers"),
+          where("boundCustomerId", "==", customerId)
+        )
+      );
+
+      const docsToUpdate = [
+        ...transactionSnapshot.docs.map((item) => ({
+          ref: item.ref,
+          data: {
+            customerCode: newCustomerCode,
+            customerName: editName.trim(),
+            updatedAt: serverTimestamp(),
+          },
+        })),
+        ...registrySnapshot.docs.map((item) => ({
+          ref: item.ref,
+          data: {
+            customerCode: newCustomerCode,
+            updatedAt: serverTimestamp(),
+          },
+        })),
+        ...pendingLineSnapshot.docs.map((item) => ({
+          ref: item.ref,
+          data: {
+            boundCustomerId: newCustomerId,
+            boundCustomerCode: newCustomerCode,
+            boundCustomerName: editName.trim(),
+            updatedAt: serverTimestamp(),
+          },
+        })),
+      ];
+
+      for (let index = 0; index < docsToUpdate.length; index += 450) {
+        const batch = writeBatch(db);
+
+        docsToUpdate.slice(index, index + 450).forEach((item) => {
+          batch.update(item.ref, item.data);
+        });
+
+        await batch.commit();
+      }
+
+      setMessage(
+        `客戶代號已由「${customer.customerCode}」修改為「${newCustomerCode}」。`
+      );
+
+      router.replace(`/postpaid/${newCustomerId}`);
     } catch (saveError) {
       console.error(saveError);
-      setError("更新客戶資料失敗。");
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "更新客戶資料失敗。"
+      );
     } finally {
       setSaving(false);
     }
@@ -480,6 +624,21 @@ export default function PostpaidCustomerDetailPage() {
             <h2 className="text-xl font-bold">客戶資料</h2>
 
             <div className="mt-5 grid gap-4 md:grid-cols-2">
+              <label className="md:col-span-2">
+                <span className="text-sm font-bold">客戶代號</span>
+                <input
+                  value={editCustomerCode}
+                  onChange={(event) =>
+                    setEditCustomerCode(event.target.value)
+                  }
+                  placeholder="例如：0059"
+                  className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3"
+                />
+                <p className="mt-2 text-xs text-slate-400">
+                  修改代號後會保留餘額、LINE 綁定與歷史帳務。
+                </p>
+              </label>
+
               <label>
                 <span className="text-sm font-bold">姓名</span>
                 <input
@@ -526,7 +685,7 @@ export default function PostpaidCustomerDetailPage() {
               disabled={saving}
               className="mt-5 w-full rounded-xl bg-slate-900 px-5 py-3 font-bold text-white disabled:opacity-50"
             >
-              儲存客戶資料
+              {saving ? "儲存中..." : "儲存客戶資料"}
             </button>
           </form>
         </section>
