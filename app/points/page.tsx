@@ -40,6 +40,14 @@ type PointRecord = {
   reversedReason: string;
 };
 
+type MemberOption = {
+  code: string;
+  name: string;
+  points: number;
+  rideCredit: number;
+  status: string;
+};
+
 type StatusFilter =
   | "all"
   | "active"
@@ -81,6 +89,10 @@ function getSourceLabel(source: string) {
     return "後台手動測試";
   }
 
+  if (source === "admin_manual_adjustment") {
+    return "後台手動調整";
+  }
+
   return source || "其他來源";
 }
 
@@ -95,6 +107,15 @@ export default function PointsPage() {
 
   const [reversingId, setReversingId] =
     useState("");
+
+  const [members, setMembers] = useState<MemberOption[]>([]);
+  const [showAdjustmentModal, setShowAdjustmentModal] = useState(false);
+  const [adjustmentMemberCode, setAdjustmentMemberCode] = useState("");
+  const [adjustmentMode, setAdjustmentMode] =
+    useState<"add" | "subtract">("add");
+  const [adjustmentPoints, setAdjustmentPoints] = useState("1");
+  const [adjustmentReason, setAdjustmentReason] = useState("");
+  const [savingAdjustment, setSavingAdjustment] = useState(false);
 
   const loadRecords = useCallback(async () => {
     setLoading(true);
@@ -190,6 +211,200 @@ export default function PointsPage() {
       setLoading(false);
     }
   }, []);
+
+  const loadMembers = useCallback(async () => {
+    try {
+      const snapshot = await getDocs(
+        collection(db, "members")
+      );
+
+      const result: MemberOption[] = snapshot.docs
+        .map((memberDocument) => {
+          const data = memberDocument.data();
+
+          return {
+            code: String(
+              data.memberCode ??
+                data.code ??
+                memberDocument.id
+            ),
+            name: String(data.name ?? ""),
+            points: Number(data.points ?? 0),
+            rideCredit: Number(data.rideCredit ?? 0),
+            status: String(data.status ?? "active"),
+          };
+        })
+        .filter((member) => member.code)
+        .sort((a, b) =>
+          a.code.localeCompare(b.code, "zh-TW")
+        );
+
+      setMembers(result);
+    } catch (error) {
+      console.error("讀取會員名單失敗：", error);
+    }
+  }, []);
+
+  const createManualAdjustment = useCallback(async () => {
+    const memberCode = adjustmentMemberCode.trim();
+    const pointValue = Math.max(
+      0,
+      Math.floor(Number(adjustmentPoints))
+    );
+    const reason = adjustmentReason.trim();
+
+    if (!memberCode) {
+      window.alert("請選擇會員。");
+      return;
+    }
+
+    if (!Number.isFinite(pointValue) || pointValue <= 0) {
+      window.alert("請輸入大於 0 的點數。");
+      return;
+    }
+
+    if (!reason) {
+      window.alert("請填寫調整原因。");
+      return;
+    }
+
+    const member = members.find(
+      (item) => item.code === memberCode
+    );
+
+    if (!member) {
+      window.alert("找不到這位會員。");
+      return;
+    }
+
+    const delta =
+      adjustmentMode === "add"
+        ? pointValue
+        : -pointValue;
+
+    const confirmed = window.confirm(
+      `確定要${adjustmentMode === "add" ? "補加" : "扣除"} ${memberCode} ${pointValue} 點嗎？\n\n會員：${member.name || "未填姓名"}\n原因：${reason}`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setSavingAdjustment(true);
+    setErrorMessage("");
+
+    try {
+      const memberRef = doc(
+        db,
+        "members",
+        memberCode
+      );
+
+      const adjustmentRef = doc(
+        collection(db, "pointTransactions")
+      );
+
+      await runTransaction(
+        db,
+        async (transaction) => {
+          const memberSnapshot =
+            await transaction.get(memberRef);
+
+          if (!memberSnapshot.exists()) {
+            throw new Error(
+              `找不到會員 ${memberCode}。`
+            );
+          }
+
+          const memberData =
+            memberSnapshot.data();
+
+          const currentPoints = Math.max(
+            0,
+            Number(memberData.points ?? 0)
+          );
+
+          const newPoints = Math.max(
+            0,
+            currentPoints + delta
+          );
+
+          const actualDelta =
+            newPoints - currentPoints;
+
+          if (actualDelta === 0) {
+            throw new Error(
+              "這次調整不會造成點數變化。"
+            );
+          }
+
+          transaction.update(memberRef, {
+            points: newPoints,
+            updatedAt: serverTimestamp(),
+          });
+
+          transaction.set(adjustmentRef, {
+            transactionId: adjustmentRef.id,
+            memberCode,
+            memberName:
+              String(memberData.name ?? member.name ?? ""),
+            points: actualDelta,
+            type: "manual_adjustment",
+            status: "active",
+            reason,
+            source: "admin_manual_adjustment",
+            spreadsheetId: "",
+            sheetName: "",
+            blockName: "",
+            sheetRow: 0,
+            rideDate: "",
+            orderContent:
+              adjustmentMode === "add"
+                ? "後台人工補點"
+                : "後台人工扣點",
+            plate: "",
+            rewardAmount: 0,
+            stableRideId: "",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      );
+
+      window.alert("人工調整紀錄已新增。");
+
+      setShowAdjustmentModal(false);
+      setAdjustmentMemberCode("");
+      setAdjustmentMode("add");
+      setAdjustmentPoints("1");
+      setAdjustmentReason("");
+
+      await Promise.all([
+        loadRecords(),
+        loadMembers(),
+      ]);
+    } catch (error) {
+      console.error("新增人工調整失敗：", error);
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : "新增人工調整失敗";
+
+      setErrorMessage(message);
+      window.alert(message);
+    } finally {
+      setSavingAdjustment(false);
+    }
+  }, [
+    adjustmentMemberCode,
+    adjustmentMode,
+    adjustmentPoints,
+    adjustmentReason,
+    members,
+    loadRecords,
+    loadMembers,
+  ]);
 
   const reversePointRecord = useCallback(
     async (record: PointRecord) => {
@@ -463,7 +678,8 @@ export default function PointsPage() {
 
   useEffect(() => {
     void loadRecords();
-  }, [loadRecords]);
+    void loadMembers();
+  }, [loadRecords, loadMembers]);
 
   const filteredRecords = useMemo(() => {
     const keyword = searchText
@@ -517,6 +733,11 @@ export default function PointsPage() {
     0
   );
 
+  const manualAdjustmentRecords = records.filter(
+    (record) =>
+      record.source === "admin_manual_adjustment"
+  );
+
   return (
     <main className="min-h-screen bg-[#f4f7fb] text-slate-900">
       <div className="flex min-h-screen">
@@ -541,21 +762,34 @@ export default function PointsPage() {
                 </p>
               </div>
 
-              <button
-                type="button"
-                onClick={() => void loadRecords()}
-                disabled={loading}
-                className="rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {loading ? "整理中…" : "重新整理"}
-              </button>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowAdjustmentModal(true)}
+                  className="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
+                >
+                  ＋ 新增調整紀錄
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    void loadRecords();
+                    void loadMembers();
+                  }}
+                  disabled={loading}
+                  className="rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {loading ? "整理中…" : "重新整理"}
+                </button>
+              </div>
             </header>
 
             <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <SummaryCard
                 title="全部紀錄"
                 value={`${records.length} 筆`}
-                note="包含有效與已撤回紀錄"
+                note={`包含有效、已撤回與 ${manualAdjustmentRecords.length} 筆人工調整`}
               />
 
               <SummaryCard
@@ -727,6 +961,138 @@ export default function PointsPage() {
           </div>
         </section>
       </div>
+
+      {showAdjustmentModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+          <div className="w-full max-w-xl rounded-3xl bg-white p-6 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-blue-600">
+                  人工修改紀錄
+                </p>
+                <h2 className="mt-1 text-2xl font-bold">
+                  新增集點調整
+                </h2>
+                <p className="mt-2 text-sm text-slate-500">
+                  不修改舊紀錄，會新增一筆獨立的人工調整紀錄。
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowAdjustmentModal(false)}
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-500"
+              >
+                關閉
+              </button>
+            </div>
+
+            <div className="mt-6 space-y-4">
+              <label className="block">
+                <span className="text-sm font-bold">會員</span>
+
+                <select
+                  value={adjustmentMemberCode}
+                  onChange={(event) =>
+                    setAdjustmentMemberCode(event.target.value)
+                  }
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-4 py-3"
+                >
+                  <option value="">請選擇會員</option>
+
+                  {members.map((member) => (
+                    <option
+                      key={member.code}
+                      value={member.code}
+                    >
+                      {member.code}
+                      {member.name ? `｜${member.name}` : ""}
+                      {`｜目前 ${member.points} 點`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label>
+                  <span className="text-sm font-bold">
+                    調整類型
+                  </span>
+
+                  <select
+                    value={adjustmentMode}
+                    onChange={(event) =>
+                      setAdjustmentMode(
+                        event.target.value as
+                          | "add"
+                          | "subtract"
+                      )
+                    }
+                    className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-4 py-3"
+                  >
+                    <option value="add">補加點數</option>
+                    <option value="subtract">扣除點數</option>
+                  </select>
+                </label>
+
+                <label>
+                  <span className="text-sm font-bold">點數</span>
+
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={adjustmentPoints}
+                    onChange={(event) =>
+                      setAdjustmentPoints(event.target.value)
+                    }
+                    className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3"
+                  />
+                </label>
+              </div>
+
+              <label className="block">
+                <span className="text-sm font-bold">
+                  修改原因
+                </span>
+
+                <textarea
+                  rows={4}
+                  value={adjustmentReason}
+                  onChange={(event) =>
+                    setAdjustmentReason(event.target.value)
+                  }
+                  placeholder="例如：調度誤刪、補登搭乘、人工更正"
+                  className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3"
+                />
+              </label>
+
+              <div className="rounded-2xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
+                此功能只調整會員目前點數，不會自動增加搭乘次數，也不會自動兌換乘車金；系統會保留完整人工修改紀錄。
+              </div>
+            </div>
+
+            <div className="mt-6 flex gap-3">
+              <button
+                type="button"
+                onClick={() => setShowAdjustmentModal(false)}
+                className="flex-1 rounded-xl border border-slate-200 px-4 py-3 font-semibold text-slate-600"
+              >
+                取消
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void createManualAdjustment()}
+                disabled={savingAdjustment}
+                className="flex-1 rounded-xl bg-blue-600 px-4 py-3 font-semibold text-white disabled:opacity-50"
+              >
+                {savingAdjustment ? "儲存中…" : "確認新增"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
@@ -776,7 +1142,7 @@ function PointTableRow({
               : "bg-amber-100 text-amber-700"
           }`}
         >
-          +{record.points} 點
+          {record.points > 0 ? "+" : ""}{record.points} 點
         </span>
       </td>
 
@@ -895,7 +1261,7 @@ function PointMobileCard({
       <div className="mt-4 grid grid-cols-2 gap-3">
         <InfoItem
           title="點數"
-          value={`+${record.points} 點`}
+          value={`${record.points > 0 ? "+" : ""}${record.points} 點`}
         />
 
         <InfoItem
