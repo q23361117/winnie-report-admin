@@ -202,71 +202,35 @@ function formatMoney(value: number) {
 
 /* =========================================================
    Google 試算表 API
+   改由 Next.js Server API 代理，避免瀏覽器直接呼叫 Apps Script
 ========================================================= */
 
-/**
- * 重要：
- *
- * 原本 server component 使用：
- *
- * GOOGLE_SHEETS_API_URL
- *
- * 現在首頁改成 Client Component 即時監控，
- * 所以前端需要：
- *
- * NEXT_PUBLIC_GOOGLE_SHEETS_API_URL
- *
- * 建議 .env.local 同時保留：
- *
- * GOOGLE_SHEETS_API_URL=原本網址
- * NEXT_PUBLIC_GOOGLE_SHEETS_API_URL=同一個網址
- */
-
-function getGoogleSheetsApiUrl() {
-  return (
-    process.env.NEXT_PUBLIC_GOOGLE_SHEETS_API_URL ??
-    ""
-  ).trim();
-}
-
 async function fetchDashboardData() {
-  const apiUrl = getGoogleSheetsApiUrl();
-
-  if (!apiUrl) {
-    throw new Error(
-      "尚未設定 NEXT_PUBLIC_GOOGLE_SHEETS_API_URL"
-    );
-  }
-
-  const url = new URL(apiUrl);
-
-  /**
-   * 避免瀏覽器 / CDN 快取舊資料
-   */
-  url.searchParams.set("_live", String(Date.now()));
-
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    cache: "no-store",
-    redirect: "follow",
-    headers: {
-      Accept: "application/json",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Google 試算表 API 回傳錯誤：${response.status}`
-    );
-  }
+  const response = await fetch(
+    `/api/dashboard?_live=${Date.now()}`,
+    {
+      method: "GET",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+      },
+    }
+  );
 
   const result =
     (await response.json()) as DashboardApiResponse;
 
+  if (!response.ok) {
+    throw new Error(
+      result.message ||
+        `Dashboard API 回傳錯誤：${response.status}`
+    );
+  }
+
   if (!result.success || !result.data) {
     throw new Error(
       result.message ||
-        "Google 試算表沒有回傳有效資料"
+        "Dashboard API 沒有回傳有效資料"
     );
   }
 
