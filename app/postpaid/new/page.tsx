@@ -1,24 +1,11 @@
+
 "use client";
 
 import Link from "next/link";
 import { FormEvent, useState } from "react";
-import {
-  doc,
-  getDoc,
-  serverTimestamp,
-  setDoc,
-} from "firebase/firestore";
 import { useRouter } from "next/navigation";
-import { db } from "@/lib/firebase";
-
-async function sha256(value: string) {
-  const bytes = new TextEncoder().encode(value);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
+import { getAuth } from "firebase/auth";
+import "@/lib/firebase";
 
 function normalizeCustomerCode(value: string) {
   return value.replace(/\s+/g, "").toUpperCase();
@@ -39,6 +26,8 @@ export default function NewPostpaidCustomerPage() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
+    if (saving) return;
+
     const normalizedCode = normalizeCustomerCode(customerCode);
     const balance = Number(openingBalance);
 
@@ -52,8 +41,11 @@ export default function NewPostpaidCustomerPage() {
       return;
     }
 
-    if (!Number.isFinite(balance)) {
-      setError("初始餘額格式不正確。");
+    if (
+      !openingBalance.trim() ||
+      !Number.isSafeInteger(balance)
+    ) {
+      setError("初始餘額必須是有效的整數。");
       return;
     }
 
@@ -61,32 +53,56 @@ export default function NewPostpaidCustomerPage() {
     setError("");
 
     try {
-      const customerId = (await sha256(normalizedCode)).slice(0, 40);
-      const customerRef = doc(db, "postpaidCustomers", customerId);
-      const existing = await getDoc(customerRef);
+      const auth = getAuth();
+      const user = auth.currentUser;
 
-      if (existing.exists()) {
-        throw new Error("這個客戶代號已經建立過。");
+      if (!user) {
+        throw new Error(
+          "目前沒有 Firebase 登入狀態，請先使用管理員帳號登入。"
+        );
       }
 
-      await setDoc(customerRef, {
-        customerCode: normalizedCode,
-        name: name.trim(),
-        phone: phone.trim(),
-        openingBalance: balance,
-        balance,
-        totalRides: 0,
-        totalPostpaidAmount: 0,
-        lineUserId: lineUserId.trim(),
-        note: note.trim(),
-        status: "active",
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      const idToken = await user.getIdToken();
+
+      const response = await fetch("/api/postpaid/customers", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        cache: "no-store",
+        body: JSON.stringify({
+          customerCode: normalizedCode,
+          name: name.trim(),
+          phone: phone.trim(),
+          openingBalance: balance,
+          lineUserId: lineUserId.trim(),
+          note: note.trim(),
+        }),
       });
 
-      router.push(`/postpaid/${customerId}`);
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          result.error || "新增後結客戶失敗。"
+        );
+      }
+
+      if (!result.customerId) {
+        throw new Error(
+          "建立結果缺少客戶編號，請先檢查客戶名單。"
+        );
+      }
+
+      router.push(`/postpaid/${result.customerId}`);
+      router.refresh();
     } catch (submitError) {
-      console.error(submitError);
+      console.error(
+        "新增後結客戶失敗：",
+        submitError
+      );
+
       setError(
         submitError instanceof Error
           ? submitError.message
@@ -105,7 +121,9 @@ export default function NewPostpaidCustomerPage() {
             <p className="text-sm font-semibold text-blue-600">
               後結帳務系統
             </p>
-            <h1 className="mt-1 text-3xl font-bold">新增後結客戶</h1>
+            <h1 className="mt-1 text-3xl font-bold">
+              新增後結客戶
+            </h1>
           </div>
 
           <Link
@@ -122,10 +140,15 @@ export default function NewPostpaidCustomerPage() {
         >
           <div className="grid gap-5 md:grid-cols-2">
             <label className="block">
-              <span className="text-sm font-bold">客戶代號 *</span>
+              <span className="text-sm font-bold">
+                客戶代號 *
+              </span>
               <input
+                required
                 value={customerCode}
-                onChange={(event) => setCustomerCode(event.target.value)}
+                onChange={(event) =>
+                  setCustomerCode(event.target.value)
+                }
                 placeholder="例如：0059/左"
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
@@ -135,31 +158,46 @@ export default function NewPostpaidCustomerPage() {
             </label>
 
             <label className="block">
-              <span className="text-sm font-bold">客戶姓名 *</span>
+              <span className="text-sm font-bold">
+                客戶姓名 *
+              </span>
               <input
+                required
                 value={name}
-                onChange={(event) => setName(event.target.value)}
+                onChange={(event) =>
+                  setName(event.target.value)
+                }
                 placeholder="輸入客戶姓名"
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
             </label>
 
             <label className="block">
-              <span className="text-sm font-bold">手機號碼</span>
+              <span className="text-sm font-bold">
+                手機號碼
+              </span>
               <input
                 value={phone}
-                onChange={(event) => setPhone(event.target.value)}
+                onChange={(event) =>
+                  setPhone(event.target.value)
+                }
                 placeholder="例如：0988330647"
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
             </label>
 
             <label className="block">
-              <span className="text-sm font-bold">初始餘額</span>
+              <span className="text-sm font-bold">
+                初始餘額
+              </span>
               <input
                 type="number"
+                step="1"
+                required
                 value={openingBalance}
-                onChange={(event) => setOpeningBalance(event.target.value)}
+                onChange={(event) =>
+                  setOpeningBalance(event.target.value)
+                }
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
               <span className="mt-2 block text-xs text-slate-400">
@@ -168,20 +206,28 @@ export default function NewPostpaidCustomerPage() {
             </label>
 
             <label className="block md:col-span-2">
-              <span className="text-sm font-bold">LINE User ID</span>
+              <span className="text-sm font-bold">
+                LINE User ID
+              </span>
               <input
                 value={lineUserId}
-                onChange={(event) => setLineUserId(event.target.value)}
+                onChange={(event) =>
+                  setLineUserId(event.target.value)
+                }
                 placeholder="可先留空，日後再綁定"
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
             </label>
 
             <label className="block md:col-span-2">
-              <span className="text-sm font-bold">備註</span>
+              <span className="text-sm font-bold">
+                備註
+              </span>
               <textarea
                 value={note}
-                onChange={(event) => setNote(event.target.value)}
+                onChange={(event) =>
+                  setNote(event.target.value)
+                }
                 rows={4}
                 placeholder="可記錄帳務方式、聯絡時間或其他資訊"
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
@@ -190,7 +236,10 @@ export default function NewPostpaidCustomerPage() {
           </div>
 
           {error && (
-            <div className="mt-5 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">
+            <div
+              role="alert"
+              className="mt-5 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700"
+            >
               {error}
             </div>
           )}
@@ -208,7 +257,9 @@ export default function NewPostpaidCustomerPage() {
               disabled={saving}
               className="rounded-xl bg-blue-600 px-6 py-3 text-sm font-bold text-white disabled:opacity-50"
             >
-              {saving ? "建立中..." : "建立後結客戶"}
+              {saving
+                ? "建立中..."
+                : "建立後結客戶"}
             </button>
           </div>
         </form>
