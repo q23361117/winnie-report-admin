@@ -3,43 +3,19 @@ import { NextRequest, NextResponse } from "next/server";
 import { createHash } from "node:crypto";
 
 import {
-  cert,
-  getApps,
-  initializeApp,
-  applicationDefault,
-} from "firebase-admin/app";
-
-import { getAuth } from "firebase-admin/auth";
-
-import {
   FieldValue,
-  getFirestore,
 } from "firebase-admin/firestore";
+
+import { adminDb } from "@/lib/firebase-admin";
+import { getAdminSession } from "@/lib/admin-session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function getAdminApp() {
-  const existing = getApps()[0];
-  if (existing) return existing;
-
-  const encoded =
-    process.env.FIREBASE_ADMIN_SERVICE_ACCOUNT_BASE64;
-
-  if (encoded) {
-    const json = JSON.parse(
-      Buffer.from(encoded, "base64").toString("utf8")
-    );
-
-    return initializeApp({
-      credential: cert(json),
-    });
-  }
-
-  return initializeApp({
-    credential: applicationDefault(),
-  });
-}
+// ========================================
+// 維尼車隊｜新增後結客戶 API
+// 使用管理員 Session Cookie 驗證
+// ========================================
 
 function normalizeCode(value: string) {
   return value.replace(/\s+/g, "").toUpperCase();
@@ -52,67 +28,74 @@ function getCustomerId(code: string) {
     .slice(0, 40);
 }
 
-function jsonError(message: string, status: number) {
+function jsonError(
+  message: string,
+  status: number
+) {
   return NextResponse.json(
-    { success: false, error: message },
+    {
+      success: false,
+      error: message,
+    },
     { status }
   );
 }
 
+// ========================================
+// 新增後結客戶
+// ========================================
+
 export async function POST(request: NextRequest) {
+  // 只接受本站送出的寫入請求
+  const origin = request.headers.get("origin");
+
+  if (origin !== request.nextUrl.origin) {
+    return jsonError(
+      "不允許跨網站新增客戶。",
+      403
+    );
+  }
+
+  // ======================================
+  // 管理員 Session 驗證
+  // ======================================
+
+  const admin = await getAdminSession();
+
+  if (!admin) {
+    return jsonError(
+      "管理員登入已失效，請重新登入。",
+      401
+    );
+  }
+
   try {
-    const authHeader =
-      request.headers.get("authorization") || "";
-
-    if (!authHeader.startsWith("Bearer ")) {
-      return jsonError("缺少登入驗證資訊。", 401);
-    }
-
-    const idToken = authHeader.slice(7).trim();
-
-    if (!idToken) {
-      return jsonError("登入驗證資訊無效。", 401);
-    }
-
-    const adminApp = getAdminApp();
-
-    let decoded;
-
-    try {
-      decoded = await getAuth(adminApp)
-        .verifyIdToken(idToken, true);
-    } catch {
-      return jsonError(
-        "登入已失效，請重新登入。",
-        401
-      );
-    }
-
-    // 只有具備 Firebase admin Custom Claim
-    // 的管理員才能建立後結客戶。
-    if (decoded.admin !== true) {
-      return jsonError(
-        "目前帳號沒有新增後結客戶的管理員權限。",
-        403
-      );
-    }
+    // ====================================
+    // 解析新增客戶資料
+    // ====================================
 
     let body: Record<string, unknown>;
 
     try {
-      const input = await request.json();
+      const input: unknown = await request.json();
 
       if (
         !input ||
         typeof input !== "object" ||
         Array.isArray(input)
       ) {
-        return jsonError("資料格式不正確。", 400);
+        return jsonError(
+          "新增客戶資料格式不正確。",
+          400
+        );
       }
 
       body = input as Record<string, unknown>;
     } catch {
-      return jsonError("無法解析新增資料。", 400);
+      return jsonError(
+        "無法解析新增客戶資料。",
+        400
+      );
     }
 
     const customerCode =
@@ -141,6 +124,10 @@ export async function POST(request: NextRequest) {
         : "";
 
     const balance = body.openingBalance;
+
+    // ====================================
+    // 檢查必填資料
+    // ====================================
 
     if (
       !customerCode ||
@@ -180,16 +167,22 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const customerId = getCustomerId(customerCode);
+    // ====================================
+    // 產生固定客戶 ID
+    // ====================================
 
-    const db = getFirestore(adminApp);
+    const customerId =
+      getCustomerId(customerCode);
 
-    const customerRef = db
+    const customerRef = adminDb
       .collection("postpaidCustomers")
       .doc(customerId);
 
-    // 原子建立：同時避免多個請求重複建立。
-    // 不覆蓋已有客戶及餘額。
+    // ====================================
+    // 建立客戶
+    // create() 不會覆蓋已存在的客戶
+    // ====================================
+
     try {
       await customerRef.create({
         customerCode,
@@ -205,12 +198,12 @@ export async function POST(request: NextRequest) {
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
-    } catch (error: unknown) {
+    } catch (writeError: unknown) {
       const code =
-        typeof error === "object" &&
-        error !== null &&
-        "code" in error
-          ? String(error.code)
+        typeof writeError === "object" &&
+        writeError !== null &&
+        "code" in writeError
+          ? String(writeError.code)
           : "";
 
       if (
@@ -223,8 +216,12 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      throw error;
+      throw writeError;
     }
+
+    // ====================================
+    // 新增成功
+    // ====================================
 
     return NextResponse.json(
       {
@@ -242,7 +239,7 @@ export async function POST(request: NextRequest) {
     );
 
     return jsonError(
-      "伺服器新增失敗，請檢查後端設定與紀錄。",
+      "伺服器新增客戶失敗，請檢查部署紀錄。",
       500
     );
   }
