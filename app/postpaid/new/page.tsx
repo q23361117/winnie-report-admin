@@ -4,8 +4,6 @@
 import Link from "next/link";
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getAuth } from "firebase/auth";
-import "@/lib/firebase";
 
 function normalizeCustomerCode(value: string) {
   return value.replace(/\s+/g, "").toUpperCase();
@@ -53,35 +51,37 @@ export default function NewPostpaidCustomerPage() {
     setError("");
 
     try {
-      const auth = getAuth();
-      const user = auth.currentUser;
-
-      if (!user) {
-        throw new Error(
-          "目前沒有 Firebase 登入狀態，請先使用管理員帳號登入。"
-        );
-      }
-
-      const idToken = await user.getIdToken();
-
-      const response = await fetch("/api/postpaid/customers", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${idToken}`,
-        },
-        cache: "no-store",
-        body: JSON.stringify({
-          customerCode: normalizedCode,
-          name: name.trim(),
-          phone: phone.trim(),
-          openingBalance: balance,
-          lineUserId: lineUserId.trim(),
-          note: note.trim(),
-        }),
-      });
+      // 使用管理員 Session Cookie
+      // 不再透過 Firebase auth.currentUser 驗證
+      const response = await fetch(
+        "/api/postpaid/customers",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          credentials: "same-origin",
+          cache: "no-store",
+          body: JSON.stringify({
+            customerCode: normalizedCode,
+            name: name.trim(),
+            phone: phone.trim(),
+            openingBalance: balance,
+            lineUserId: lineUserId.trim(),
+            note: note.trim(),
+          }),
+        }
+      );
 
       const result = await response.json();
+
+      if (response.status === 401) {
+        router.push("/admin-login");
+
+        throw new Error(
+          "管理員登入已失效，請重新登入。"
+        );
+      }
 
       if (!response.ok) {
         throw new Error(
@@ -95,6 +95,7 @@ export default function NewPostpaidCustomerPage() {
         );
       }
 
+      // 新增成功後跳轉至客戶帳務
       router.push(`/postpaid/${result.customerId}`);
       router.refresh();
     } catch (submitError) {
@@ -121,6 +122,7 @@ export default function NewPostpaidCustomerPage() {
             <p className="text-sm font-semibold text-blue-600">
               後結帳務系統
             </p>
+
             <h1 className="mt-1 text-3xl font-bold">
               新增後結客戶
             </h1>
@@ -143,6 +145,7 @@ export default function NewPostpaidCustomerPage() {
               <span className="text-sm font-bold">
                 客戶代號 *
               </span>
+
               <input
                 required
                 value={customerCode}
@@ -152,6 +155,7 @@ export default function NewPostpaidCustomerPage() {
                 placeholder="例如：0059/左"
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
+
               <span className="mt-2 block text-xs text-slate-400">
                 必須與 Google 報表的客戶代號完全一致。
               </span>
@@ -161,6 +165,7 @@ export default function NewPostpaidCustomerPage() {
               <span className="text-sm font-bold">
                 客戶姓名 *
               </span>
+
               <input
                 required
                 value={name}
@@ -176,7 +181,9 @@ export default function NewPostpaidCustomerPage() {
               <span className="text-sm font-bold">
                 手機號碼
               </span>
+
               <input
+                type="tel"
                 value={phone}
                 onChange={(event) =>
                   setPhone(event.target.value)
@@ -190,6 +197,7 @@ export default function NewPostpaidCustomerPage() {
               <span className="text-sm font-bold">
                 初始餘額
               </span>
+
               <input
                 type="number"
                 step="1"
@@ -200,6 +208,7 @@ export default function NewPostpaidCustomerPage() {
                 }
                 className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-blue-500"
               />
+
               <span className="mt-2 block text-xs text-slate-400">
                 欠款請輸入負數，例如欠 527 元填 -527。
               </span>
@@ -209,6 +218,7 @@ export default function NewPostpaidCustomerPage() {
               <span className="text-sm font-bold">
                 LINE User ID
               </span>
+
               <input
                 value={lineUserId}
                 onChange={(event) =>
@@ -223,6 +233,7 @@ export default function NewPostpaidCustomerPage() {
               <span className="text-sm font-bold">
                 備註
               </span>
+
               <textarea
                 value={note}
                 onChange={(event) =>
