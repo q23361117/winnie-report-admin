@@ -4,15 +4,6 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import {
-  collection,
-  doc,
-  onSnapshot,
-  runTransaction,
-  serverTimestamp,
-  Timestamp,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
 
 type PendingLineUser = {
   id: string;
@@ -27,7 +18,7 @@ type PendingLineUser = {
   boundCustomerCode: string;
   boundCustomerName: string;
   isFriend: boolean;
-  lastSeenAt?: Timestamp;
+  lastSeenAt?: number;
 };
 
 type PostpaidCustomer = {
@@ -39,7 +30,7 @@ type PostpaidCustomer = {
   status: string;
 };
 
-function formatDate(value?: Timestamp) {
+function formatDate(value?: number) {
   if (!value) {
     return "—";
   }
@@ -51,7 +42,7 @@ function formatDate(value?: Timestamp) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(value.toDate());
+  }).format(new Date(value));
 }
 
 function maskLineUserId(value: string) {
@@ -79,83 +70,68 @@ export default function BindPostpaidLinePage() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, "pendingLineUsers"),
-      (snapshot) => {
-        const rows = snapshot.docs.map((document) => {
-          const data = document.data();
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [fetchingMore, setFetchingMore] = useState(false);
 
-          return {
-            id: document.id,
-            lineUserId: String(data.lineUserId ?? ""),
-            displayName: String(data.displayName ?? ""),
-            pictureUrl: String(data.pictureUrl ?? ""),
-            statusMessage: String(data.statusMessage ?? ""),
-            lastMessage: String(data.lastMessage ?? ""),
-            eventType: String(data.eventType ?? ""),
-            bindingStatus: String(data.bindingStatus ?? "pending"),
-            boundCustomerId: String(data.boundCustomerId ?? ""),
-            boundCustomerCode: String(data.boundCustomerCode ?? ""),
-            boundCustomerName: String(data.boundCustomerName ?? ""),
-            isFriend: Boolean(data.isFriend ?? true),
-            lastSeenAt:
-              data.lastSeenAt instanceof Timestamp
-                ? data.lastSeenAt
-                : undefined,
-          } satisfies PendingLineUser;
-        });
-
-        rows.sort((a, b) => {
-          const aTime = a.lastSeenAt?.toMillis() ?? 0;
-          const bTime = b.lastSeenAt?.toMillis() ?? 0;
-          return bTime - aTime;
-        });
-
-        setLineUsers(rows);
-        setLoading(false);
-      },
-      (snapshotError) => {
-        console.error(snapshotError);
-        setError("讀取 LINE 待綁定名單失敗，請檢查 Firestore 權限。");
-        setLoading(false);
-      }
-    );
-
-    return unsubscribe;
-  }, []);
+  async function loadPage(nextCursor: string | null, replace = false) {
+    if (!replace) setFetchingMore(true);
+    setError("");
+    try {
+      const url = nextCursor
+        ? `/api/postpaid/line-bindings?cursor=${encodeURIComponent(nextCursor)}`
+        : "/api/postpaid/line-bindings";
+      const response = await fetch(url, { credentials: "same-origin", cache: "no-store" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "讀取待綁定名單失敗");
+      setLineUsers((previous) => replace
+        ? result.users
+        : [...previous, ...result.users.filter((u: PendingLineUser) =>
+            !previous.some((p) => p.id === u.id))]);
+      setCustomers(result.customers);
+      setCursor(result.nextCursor ?? null);
+      setHasMore(Boolean(result.hasMore));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "讀取失敗");
+    } finally {
+      setLoading(false);
+      setFetchingMore(false);
+    }
+  }
 
   useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, "postpaidCustomers"),
-      (snapshot) => {
-        const rows = snapshot.docs.map((document) => {
-          const data = document.data();
-
-          return {
-            id: document.id,
-            customerCode: String(data.customerCode ?? ""),
-            name: String(data.name ?? ""),
-            phone: String(data.phone ?? ""),
-            lineUserId: String(data.lineUserId ?? ""),
-            status: String(data.status ?? "active"),
-          } satisfies PostpaidCustomer;
-        });
-
-        rows.sort((a, b) =>
-          a.customerCode.localeCompare(b.customerCode, "zh-TW")
-        );
-
-        setCustomers(rows);
-      },
-      (snapshotError) => {
-        console.error(snapshotError);
-        setError("讀取後結客戶名單失敗。");
-      }
-    );
-
-    return unsubscribe;
+    void loadPage(null, true);
+    // 初次載入一次，不啟用全集合即時監聽。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function submitBinding(action: "bind" | "unbind", user: PendingLineUser, customerId?: string) {
+    setWorkingId(user.id);
+    setError("");
+    setMessage("");
+    try {
+      const response = await fetch("/api/postpaid/line-bindings", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, pendingId: user.id, customerId }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "操作失敗");
+      setMessage(action === "bind" ? "LINE 綁定成功，未修改客戶餘額。" : "LINE 綁定已解除。");
+      setSelectedCustomers((previous) => {
+        const next = { ...previous };
+        delete next[user.id];
+        return next;
+      });
+      // 只重新讀取第一頁，不保留可能過期的資料。
+      await loadPage(null, true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "操作失敗");
+    } finally {
+      setWorkingId("");
+    }
+  }
 
   const filteredUsers = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase();
@@ -193,174 +169,19 @@ export default function BindPostpaidLinePage() {
 
   async function bindLineUser(user: PendingLineUser) {
     const customerId = selectedCustomers[user.id];
-
-    if (!customerId) {
-      setError("請先選擇要綁定的後結客戶。");
-      return;
+    const customer = customers.find((c) => c.id === customerId);
+    if (!customer) return setError("請先選擇有效的後結客戶。");
+    if (!user.lineUserId) return setError("缺少 LINE User ID。");
+    if (customer.lineUserId && customer.lineUserId !== user.lineUserId) {
+      return setError("該客戶已綁其他 LINE，請先解除原綁定。");
     }
-
-    const customer = customers.find(
-      (item) => item.id === customerId
-    );
-
-    if (!customer) {
-      setError("找不到選擇的後結客戶。");
-      return;
-    }
-
-    if (!user.lineUserId) {
-      setError("這筆 LINE 使用者資料缺少 lineUserId。");
-      return;
-    }
-
-    const overwriteMessage =
-      customer.lineUserId &&
-      customer.lineUserId !== user.lineUserId
-        ? `「${customer.customerCode}」目前已綁定其他 LINE，確定要改綁為「${user.displayName || "此使用者"}」嗎？`
-        : `確定將「${user.displayName || "此 LINE 使用者"}」綁定到「${customer.customerCode}｜${customer.name}」嗎？`;
-
-    if (!window.confirm(overwriteMessage)) {
-      return;
-    }
-
-    setWorkingId(user.id);
-    setError("");
-    setMessage("");
-
-    try {
-      const pendingRef = doc(db, "pendingLineUsers", user.id);
-      const customerRef = doc(db, "postpaidCustomers", customerId);
-
-      await runTransaction(db, async (transaction) => {
-        const [pendingSnapshot, customerSnapshot] = await Promise.all([
-          transaction.get(pendingRef),
-          transaction.get(customerRef),
-        ]);
-
-        if (!pendingSnapshot.exists()) {
-          throw new Error("待綁定 LINE 使用者已不存在。");
-        }
-
-        if (!customerSnapshot.exists()) {
-          throw new Error("後結客戶已不存在。");
-        }
-
-        transaction.update(customerRef, {
-          lineUserId: user.lineUserId,
-          lineDisplayName: user.displayName,
-          linePictureUrl: user.pictureUrl,
-          lineBoundAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-
-        transaction.update(pendingRef, {
-          bindingStatus: "bound",
-          boundCustomerId: customerId,
-          boundCustomerCode: customer.customerCode,
-          boundCustomerName: customer.name,
-          boundAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      });
-
-      setMessage(
-        `已將「${user.displayName || "LINE 使用者"}」綁定到「${customer.customerCode}｜${customer.name}」。`
-      );
-
-      setSelectedCustomers((current) => {
-        const next = { ...current };
-        delete next[user.id];
-        return next;
-      });
-    } catch (bindError) {
-      console.error(bindError);
-      setError(
-        bindError instanceof Error
-          ? bindError.message
-          : "LINE 綁定失敗。"
-      );
-    } finally {
-      setWorkingId("");
-    }
+    if (!window.confirm(`確定將「${user.displayName || "LINE 使用者"}」綁定至「${customer.customerCode}｜${customer.name}」嗎？`)) return;
+    await submitBinding("bind", user, customerId);
   }
 
   async function unbindLineUser(user: PendingLineUser) {
-    if (!user.boundCustomerId) {
-      setError("這筆資料沒有綁定的後結客戶。");
-      return;
-    }
-
-    if (
-      !window.confirm(
-        `確定解除「${user.displayName || "此 LINE 使用者"}」與「${user.boundCustomerCode}」的綁定嗎？`
-      )
-    ) {
-      return;
-    }
-
-    setWorkingId(user.id);
-    setError("");
-    setMessage("");
-
-    try {
-      const pendingRef = doc(db, "pendingLineUsers", user.id);
-      const customerRef = doc(
-        db,
-        "postpaidCustomers",
-        user.boundCustomerId
-      );
-
-      await runTransaction(db, async (transaction) => {
-        const [pendingSnapshot, customerSnapshot] = await Promise.all([
-          transaction.get(pendingRef),
-          transaction.get(customerRef),
-        ]);
-
-        if (!pendingSnapshot.exists()) {
-          throw new Error("LINE 使用者資料已不存在。");
-        }
-
-        if (customerSnapshot.exists()) {
-          const customerData = customerSnapshot.data();
-          const currentLineUserId = String(
-            customerData.lineUserId ?? ""
-          );
-
-          if (
-            !currentLineUserId ||
-            currentLineUserId === user.lineUserId
-          ) {
-            transaction.update(customerRef, {
-              lineUserId: "",
-              lineDisplayName: "",
-              linePictureUrl: "",
-              lineBoundAt: null,
-              updatedAt: serverTimestamp(),
-            });
-          }
-        }
-
-        transaction.update(pendingRef, {
-          bindingStatus: "pending",
-          boundCustomerId: "",
-          boundCustomerCode: "",
-          boundCustomerName: "",
-          boundAt: null,
-          updatedAt: serverTimestamp(),
-        });
-      });
-
-      setMessage("LINE 綁定已解除。");
-    } catch (unbindError) {
-      console.error(unbindError);
-      setError(
-        unbindError instanceof Error
-          ? unbindError.message
-          : "解除綁定失敗。"
-      );
-    } finally {
-      setWorkingId("");
-    }
+    if (!window.confirm(`確定解除「${user.displayName || "LINE 使用者"}」的綁定嗎？`)) return;
+    await submitBinding("unbind", user);
   }
 
   return (
@@ -400,7 +221,7 @@ export default function BindPostpaidLinePage() {
           <article className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200/70">
             <p className="text-sm text-slate-500">等待綁定</p>
             <p className="mt-4 text-3xl font-bold text-amber-600">
-              {pendingCount} 位
+              {pendingCount} 位（已載入）
             </p>
           </article>
 
@@ -441,7 +262,7 @@ export default function BindPostpaidLinePage() {
             <div>
               <h2 className="text-xl font-bold">LINE 使用者名單</h2>
               <p className="mt-1 text-sm text-slate-500">
-                建議先確認最近訊息與 LINE 顯示名稱，再選擇客戶。
+                每頁最多載入 50 筆；搜尋僅涵蓋已載入資料，可按下方「載入更多」。不再監聽完整集合。
               </p>
             </div>
 
@@ -607,6 +428,19 @@ export default function BindPostpaidLinePage() {
                 </article>
               ))
             )}
+          </div>
+          <div className="mt-6 flex flex-wrap justify-center gap-3">
+            {hasMore && (
+              <button type="button" disabled={fetchingMore}
+                onClick={() => void loadPage(cursor)}
+                className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold disabled:opacity-50">
+                {fetchingMore ? "載入中..." : "載入更多 LINE 使用者（50 筆）"}
+              </button>
+            )}
+            <button type="button" onClick={() => void loadPage(null, true)}
+              className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">
+              重新整理已載入名單
+            </button>
           </div>
         </section>
       </div>
