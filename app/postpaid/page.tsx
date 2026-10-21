@@ -23,11 +23,6 @@ type PostpaidCustomer = {
   updatedAt?: Timestamp;
 };
 
-type PendingLineUser = {
-  id: string;
-  bindingStatus: string;
-};
-
 const menuItems = [
   { name: "營運總覽", href: "/" },
   { name: "調度與財務", href: "/analytics" },
@@ -72,9 +67,10 @@ function formatRealtimeClock(value?: Date) {
 
 export default function PostpaidPage() {
   const [customers, setCustomers] = useState<PostpaidCustomer[]>([]);
-  const [pendingLineUsers, setPendingLineUsers] = useState<
-    PendingLineUser[]
-  >([]);
+  // LINE 待綁定數量以低頻聚合查詢取得，不下載完整 LINE 名單
+  const [pendingLineCount, setPendingLineCount] = useState<number | null>(null);
+  const [pendingCountError, setPendingCountError] = useState("");
+  const [pendingCountUpdatedAt, setPendingCountUpdatedAt] = useState<Date>();
 
   const [loading, setLoading] = useState(true);
 
@@ -84,9 +80,6 @@ export default function PostpaidPage() {
   const [error, setError] = useState("");
 
   const [customerConnected, setCustomerConnected] =
-    useState(false);
-
-  const [pendingConnected, setPendingConnected] =
     useState(false);
 
   const [lastUpdated, setLastUpdated] = useState<Date>();
@@ -202,45 +195,55 @@ export default function PostpaidPage() {
 
   /**
    * =====================================================
-   * LINE 待綁定 Firebase 即時監聽
+   * LINE 待綁定人數：進站讀取一次，每 5 分鐘最多更新一次
+   * 隱藏頁面時暫停，避免持續消耗 Firestore 配額
    * =====================================================
    */
   useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, "pendingLineUsers"),
+    let cancelled = false;
+    let inFlight = false;
+    const controller = new AbortController();
 
-      (snapshot) => {
-        const rows = snapshot.docs.map((document) => {
-          const data = document.data();
-
-          return {
-            id: document.id,
-
-            bindingStatus: String(
-              data.bindingStatus ?? "pending"
-            ),
-          } satisfies PendingLineUser;
+    async function loadPendingCount() {
+      if (cancelled || inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const response = await fetch("/api/postpaid/pending-count", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+          signal: controller.signal,
         });
-
-        setPendingLineUsers(rows);
-
-        setPendingConnected(true);
-
-        setLastUpdated(new Date());
-      },
-
-      (snapshotError) => {
-        console.error(
-          "讀取 LINE 待綁定名單失敗：",
-          snapshotError
-        );
-
-        setPendingConnected(false);
+        const result = await response.json() as {
+          success?: boolean;
+          pendingCount?: number;
+          error?: string;
+        };
+        if (!response.ok || !result.success ||
+            !Number.isSafeInteger(result.pendingCount) ||
+            (result.pendingCount ?? -1) < 0) {
+          throw new Error(result.error || "LINE 待綁定數量讀取失敗");
+        }
+        if (cancelled) return;
+        setPendingLineCount(result.pendingCount!);
+        setPendingCountError("");
+        setPendingCountUpdatedAt(new Date());
+      } catch (error) {
+        if (!cancelled && !controller.signal.aborted) {
+          console.error("LINE 待綁定數量讀取失敗：", error);
+          setPendingCountError("LINE 待綁定人數暫時無法更新（可能是 Firestore 配額不足）。");
+        }
+      } finally {
+        inFlight = false;
       }
-    );
+    }
 
+    void loadPendingCount();
+    const timer = window.setInterval(() => void loadPendingCount(), 300_000);
     return () => {
-      unsubscribe();
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -343,24 +346,8 @@ export default function PostpaidPage() {
     );
   }, [activeCustomers]);
 
-  /**
-   * =====================================================
-   * LINE 等待綁定數量
-   * =====================================================
-   */
-  const pendingLineCount = useMemo(() => {
-    return pendingLineUsers.filter(
-      (user) =>
-        user.bindingStatus !== "bound"
-    ).length;
-  }, [pendingLineUsers]);
-
-  /**
-   * 兩個監聽都正常才顯示即時連線中
-   */
-  const realtimeConnected =
-    customerConnected &&
-    pendingConnected;
+  // 僅後結客戶保留真正的 Firestore 即時監聽。
+  const realtimeConnected = customerConnected;
 
   return (
     <main className="min-h-screen bg-[#f4f7fb] text-slate-900">
@@ -435,7 +422,7 @@ export default function PostpaidPage() {
 
             <p className="mt-2 text-xs text-slate-400">
 
-              Firestore 即時監控
+              Firestore 後結客戶即時監控
 
             </p>
 
@@ -528,7 +515,7 @@ export default function PostpaidPage() {
 
                   🔗 LINE 待綁定
 
-                  {pendingLineCount > 0 && (
+                  {pendingLineCount !== null && pendingLineCount > 0 && (
                     <span className="ml-2 rounded-full bg-emerald-600 px-2 py-0.5 text-xs text-white">
                       {pendingLineCount}
                     </span>
@@ -645,7 +632,7 @@ export default function PostpaidPage() {
                 LINE 待綁定提醒
             ================================================= */}
 
-            {pendingLineCount > 0 && (
+            {pendingLineCount !== null && pendingLineCount > 0 && (
 
               <section className="mt-5 rounded-3xl border border-emerald-200 bg-emerald-50 p-5">
 
@@ -658,7 +645,8 @@ export default function PostpaidPage() {
                     </p>
 
                     <p className="mt-1 text-sm text-emerald-700">
-                      客人傳訊息給官方帳號後，會即時出現在待綁定名單。
+                      LINE 人數約每 5 分鐘更新，詳細名單請至綁定頁查詢。
+                      {pendingCountUpdatedAt && ` 最後統計：${formatRealtimeClock(pendingCountUpdatedAt)}`}
                     </p>
 
                   </div>
@@ -679,6 +667,12 @@ export default function PostpaidPage() {
             {/* =================================================
                 錯誤提示
             ================================================= */}
+
+            {pendingCountError && (
+              <p role="status" className="mt-3 text-sm text-amber-700">
+                {pendingCountError}
+              </p>
+            )}
 
             {error && (
 
