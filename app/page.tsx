@@ -5,7 +5,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   collection,
+  getCountFromServer,
   onSnapshot,
+  query,
+  where,
   Timestamp,
 } from "firebase/firestore";
 
@@ -63,10 +66,6 @@ type DashboardApiResponse = {
   success: boolean;
   data?: DashboardData;
   message?: string;
-};
-
-type MemberRecord = {
-  id: string;
 };
 
 type PointTransactionRecord = {
@@ -407,9 +406,11 @@ export default function Home() {
      Firestore
   ------------------------------------------------------- */
 
-  const [members, setMembers] = useState<
-    MemberRecord[]
-  >([]);
+  const [memberCount, setMemberCount] = useState(0);
+
+  // 台灣日期變換時重建今日／本月範圍監聽。
+  const [taipeiDay, setTaipeiDay] = useState(() => getTaipeiDateKey(new Date()));
+  const [taipeiMonth, setTaipeiMonth] = useState(() => getTaipeiMonthKey(new Date()));
 
   const [pointTransactions, setPointTransactions] =
     useState<PointTransactionRecord[]>([]);
@@ -526,182 +527,124 @@ export default function Home() {
   }, []);
 
   /* =======================================================
-     Firestore：會員即時監聽
+     Firestore 低讀取版本
+     - 會員僅使用 count 聚合，每 15 分鐘更新
+     - 今日點數僅監聽台灣當日交易
+     - 本月乘車金僅監聽台灣當月交易
+     - 保留後結帳務原本的即時監聽
   ======================================================= */
 
   useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, "members"),
+    // 本地時鐘輪詢不會向 Firestore 發出請求。
+    const updateCalendar = () => {
+      const now = new Date();
+      setTaipeiDay(getTaipeiDateKey(now));
+      setTaipeiMonth(getTaipeiMonthKey(now));
+    };
+    const timer = window.setInterval(updateCalendar, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
-      (snapshot) => {
-        const rows =
-          snapshot.docs.map((document) => ({
-            id: document.id,
-          }));
-
-        setMembers(rows);
-
+  useEffect(() => {
+    let cancelled = false;
+    let running = false;
+    const refreshMembers = async () => {
+      if (running || document.visibilityState === "hidden") return;
+      running = true;
+      try {
+        const result = await getCountFromServer(collection(db, "members"));
+        if (cancelled) return;
+        setMemberCount(result.data().count);
         setMembersLoaded(true);
-
-        setFirestoreError("");
-
-        setFirestoreLastUpdated(
-          new Date()
-        );
-      },
-
-      (error) => {
-        console.error(
-          "會員即時監聽失敗：",
-          error
-        );
-
+        setFirestoreLastUpdated(new Date());
+      } catch (error) {
+        if (cancelled) return;
+        console.error("會員數量讀取失敗：", error);
         setMembersLoaded(false);
-
-        setFirestoreError(
-          "Firestore 部分資料監聽失敗，請檢查權限或網路。"
-        );
+        setFirestoreError("會員數量查詢失敗，請檢查 Firestore 配額或權限。");
+      } finally {
+        running = false;
       }
-    );
-
-    return unsubscribe;
+    };
+    void refreshMembers();
+    const timer = window.setInterval(() => void refreshMembers(), 15 * 60_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refreshMembers();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
-  /* =======================================================
-     Firestore：集點紀錄即時監聽
-  ======================================================= */
-
   useEffect(() => {
+    // YYYY-MM-DD 的台灣午夜相當於前一日 16:00 UTC。
+    const start = Timestamp.fromDate(new Date(`${taipeiDay}T00:00:00+08:00`));
+    const endDate = new Date(start.toMillis() + 24 * 60 * 60 * 1000);
+    const end = Timestamp.fromDate(endDate);
+    setPointsLoaded(false);
     const unsubscribe = onSnapshot(
-      collection(
-        db,
-        "pointTransactions"
+      query(
+        collection(db, "pointTransactions"),
+        where("createdAt", ">=", start),
+        where("createdAt", "<", end)
       ),
-
       (snapshot) => {
-        const rows =
-          snapshot.docs.map(
-            (document) => {
-              const data =
-                document.data();
-
-              return {
-                id: document.id,
-
-                points: toSafeNumber(
-                  data.points
-                ),
-
-                status: String(
-                  data.status ??
-                    "active"
-                ),
-
-                createdAt:
-                  getDateFromValue(
-                    data.createdAt
-                  ),
-              };
-            }
-          );
-
-        setPointTransactions(
-          rows
-        );
-
+        setPointTransactions(snapshot.docs.map((document) => {
+          const data = document.data();
+          return {
+            id: document.id,
+            points: toSafeNumber(data.points),
+            status: String(data.status ?? "active"),
+            createdAt: getDateFromValue(data.createdAt),
+          };
+        }));
         setPointsLoaded(true);
-
-        setFirestoreError("");
-
-        setFirestoreLastUpdated(
-          new Date()
-        );
+        setFirestoreLastUpdated(new Date());
       },
-
       (error) => {
-        console.error(
-          "集點紀錄即時監聽失敗：",
-          error
-        );
-
+        console.error("今日集點監聽失敗：", error);
         setPointsLoaded(false);
-
-        setFirestoreError(
-          "Firestore 部分資料監聽失敗，請檢查權限或網路。"
-        );
+        setFirestoreError("今日集點資料查詢失敗，請檢查 Firestore 額度或權限。");
       }
     );
-
     return unsubscribe;
-  }, []);
-
-  /* =======================================================
-     Firestore：乘車金即時監聽
-  ======================================================= */
+  }, [taipeiDay]);
 
   useEffect(() => {
+    const [year, month] = taipeiMonth.split("-").map(Number);
+    const start = Timestamp.fromDate(new Date(Date.UTC(year, month - 1, 1) - 8 * 60 * 60 * 1000));
+    const end = Timestamp.fromDate(new Date(Date.UTC(year, month, 1) - 8 * 60 * 60 * 1000));
+    setCreditsLoaded(false);
     const unsubscribe = onSnapshot(
-      collection(
-        db,
-        "rideCreditTransactions"
+      query(
+        collection(db, "rideCreditTransactions"),
+        where("createdAt", ">=", start),
+        where("createdAt", "<", end)
       ),
-
       (snapshot) => {
-        const rows =
-          snapshot.docs.map(
-            (document) => {
-              const data =
-                document.data();
-
-              return {
-                id: document.id,
-
-                amount: toSafeNumber(
-                  data.amount
-                ),
-
-                status: String(
-                  data.status ??
-                    "active"
-                ),
-
-                createdAt:
-                  getDateFromValue(
-                    data.createdAt
-                  ),
-              };
-            }
-          );
-
-        setRideCreditTransactions(
-          rows
-        );
-
+        setRideCreditTransactions(snapshot.docs.map((document) => {
+          const data = document.data();
+          return {
+            id: document.id,
+            amount: toSafeNumber(data.amount),
+            status: String(data.status ?? "active"),
+            createdAt: getDateFromValue(data.createdAt),
+          };
+        }));
         setCreditsLoaded(true);
-
-        setFirestoreError("");
-
-        setFirestoreLastUpdated(
-          new Date()
-        );
+        setFirestoreLastUpdated(new Date());
       },
-
       (error) => {
-        console.error(
-          "乘車金即時監聽失敗：",
-          error
-        );
-
+        console.error("本月乘車金監聽失敗：", error);
         setCreditsLoaded(false);
-
-        setFirestoreError(
-          "Firestore 部分資料監聽失敗，請檢查權限或網路。"
-        );
+        setFirestoreError("本月乘車金資料查詢失敗，請檢查 Firestore 額度或權限。");
       }
     );
-
     return unsubscribe;
-  }, []);
+  }, [taipeiMonth]);
 
   /* =======================================================
      Firestore：後結帳務即時監聽
@@ -777,9 +720,6 @@ export default function Home() {
     creditsLoaded &&
     postpaidLoaded &&
     !firestoreError;
-
-  const memberCount =
-    members.length;
 
   const todayPoints =
     useMemo(() => {
@@ -1020,10 +960,10 @@ export default function Home() {
       ),
 
       note: firestoreConnected
-        ? "Firestore 會員資料即時統計"
+        ? "Firestore 會員數量定期統計（約 15 分鐘）"
         : "正在連接會員資料庫",
 
-      live: true,
+      live: false,
 
       icon: (
         <svg
@@ -1049,7 +989,7 @@ export default function Home() {
       ),
 
       note: firestoreConnected
-        ? "今天有效集點紀錄即時加總"
+        ? "今天有效集點紀錄即時加總（限當日）"
         : "正在連接集點紀錄",
 
       live: true,
@@ -1107,7 +1047,7 @@ export default function Home() {
       ),
 
       note: firestoreConnected
-        ? "本月有效乘車金入帳即時加總"
+        ? "本月有效乘車金入帳即時加總（限當月）"
         : "正在連接乘車金資料",
 
       live: true,
@@ -1474,7 +1414,7 @@ export default function Home() {
                   </span>
 
                   <span className="text-xs text-slate-400">
-                    Firestore 即時同步
+                    Firestore 範圍監聽／定期統計
                   </span>
 
                 </div>
@@ -1875,7 +1815,7 @@ export default function Home() {
                     </p>
 
                     <p className="mt-2 text-sm leading-6 text-emerald-700">
-                      會員、點數、乘車金與後結帳務使用 Firebase onSnapshot 即時監聽。
+                      會員數定期彙總；當日集點、本月乘車金與後結帳務使用限縮範圍的 Firestore 監聽。
                     </p>
 
                   </div>
@@ -1985,7 +1925,7 @@ export default function Home() {
                   <p className="mt-2 text-sm text-slate-500">
 
                     {overallConnected
-                      ? "Google 試算表採 5 秒快速同步，Firestore 資料採即時監聽。"
+                      ? "Google 試算表採 5 秒快速同步，Firestore 使用低讀取統計與限縮監聽。"
                       : "部分服務正在連線或發生異常，請查看下方狀態。"}
 
                   </p>
@@ -2042,7 +1982,7 @@ export default function Home() {
                   title="會員集點系統"
                   description={
                     firestoreConnected
-                      ? `目前共有 ${memberCount} 位會員，Firestore 資料即時更新。`
+                      ? `目前共有 ${memberCount} 位會員，Firestore 會員統計約每 15 分鐘更新。`
                       : "目前正在連接 Firestore 會員與集點資料。"
                   }
                   status={
