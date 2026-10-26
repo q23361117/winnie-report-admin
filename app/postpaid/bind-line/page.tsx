@@ -3,7 +3,7 @@
 /* eslint-disable @next/next/no-img-element */
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 
 type PendingLineUser = {
   id: string;
@@ -65,6 +65,9 @@ export default function BindPostpaidLinePage() {
   >({});
   const [statusFilter, setStatusFilter] = useState("pending");
   const [keyword, setKeyword] = useState("");
+  const [searchedKeyword, setSearchedKeyword] = useState("");
+  const [searchInfo, setSearchInfo] = useState("");
+  const [searchMode, setSearchMode] = useState(false);
   const [loading, setLoading] = useState(true);
   const [workingId, setWorkingId] = useState("");
   const [message, setMessage] = useState("");
@@ -74,13 +77,15 @@ export default function BindPostpaidLinePage() {
   const [hasMore, setHasMore] = useState(false);
   const [fetchingMore, setFetchingMore] = useState(false);
 
-  async function loadPage(nextCursor: string | null, replace = false) {
+  async function loadPage(nextCursor: string | null, replace = false, search = "") {
     if (!replace) setFetchingMore(true);
     setError("");
     try {
-      const url = nextCursor
-        ? `/api/postpaid/line-bindings?cursor=${encodeURIComponent(nextCursor)}`
-        : "/api/postpaid/line-bindings";
+      const url = search.trim()
+        ? `/api/postpaid/line-bindings?search=${encodeURIComponent(search.trim())}`
+        : nextCursor
+          ? `/api/postpaid/line-bindings?cursor=${encodeURIComponent(nextCursor)}`
+          : "/api/postpaid/line-bindings";
       const response = await fetch(url, { credentials: "same-origin", cache: "no-store" });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "讀取待綁定名單失敗");
@@ -91,6 +96,16 @@ export default function BindPostpaidLinePage() {
       setCustomers(result.customers);
       setCursor(result.nextCursor ?? null);
       setHasMore(Boolean(result.hasMore));
+      setSearchMode(Boolean(result.searchMode));
+      setSearchedKeyword(search.trim());
+      if (result.searchMode) {
+        const notes = [`已比對 ${result.scannedCount ?? 0} 筆 LINE 紀錄，找到 ${result.users.length} 筆結果。`];
+        if (result.scanLimitReached) notes.push("達到單次搜尋上限 1,000 筆；後面的資料尚未搜尋。");
+        if (result.resultTruncated) notes.push("最多顯示 50 筆符合結果，請增加搜尋字數。");
+        setSearchInfo(notes.join(" "));
+      } else {
+        setSearchInfo("");
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "讀取失敗");
     } finally {
@@ -125,7 +140,7 @@ export default function BindPostpaidLinePage() {
         return next;
       });
       // 只重新讀取第一頁，不保留可能過期的資料。
-      await loadPage(null, true);
+      await loadPage(null, true, searchMode ? searchedKeyword : "");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "操作失敗");
     } finally {
@@ -134,7 +149,7 @@ export default function BindPostpaidLinePage() {
   }
 
   const filteredUsers = useMemo(() => {
-    const normalizedKeyword = keyword.trim().toLowerCase();
+    const normalizedKeyword = searchMode ? "" : keyword.trim().toLowerCase();
 
     return lineUsers.filter((user) => {
       if (
@@ -157,7 +172,24 @@ export default function BindPostpaidLinePage() {
         value.toLowerCase().includes(normalizedKeyword)
       );
     });
-  }, [keyword, lineUsers, statusFilter]);
+  }, [keyword, lineUsers, statusFilter, searchMode]);
+
+  async function searchAllUsers(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const value = keyword.trim();
+    if (!value) return setError("請先輸入 LINE 暱稱、訊息或 UID。");
+    setLoading(true);
+    setStatusFilter("all");
+    setMessage("");
+    await loadPage(null, true, value);
+  }
+
+  async function clearSearch() {
+    setKeyword("");
+    setSearchInfo("");
+    setLoading(true);
+    await loadPage(null, true);
+  }
 
   const activeCustomers = customers.filter(
     (customer) => customer.status === "active"
@@ -262,7 +294,7 @@ export default function BindPostpaidLinePage() {
             <div>
               <h2 className="text-xl font-bold">LINE 使用者名單</h2>
               <p className="mt-1 text-sm text-slate-500">
-                每頁最多載入 50 筆；搜尋僅涵蓋已載入資料，可按下方「載入更多」。不再監聽完整集合。
+                平常每頁載入 50 筆；按「全庫搜尋」才會查詢尚未載入的 LINE 資料（每次最多比對 1,000 筆）。
               </p>
             </div>
 
@@ -279,15 +311,30 @@ export default function BindPostpaidLinePage() {
                 <option value="all">全部</option>
               </select>
 
-              <input
-                value={keyword}
-                onChange={(event) => setKeyword(event.target.value)}
-                placeholder="搜尋名稱、訊息或客戶代號..."
-                className="min-w-72 rounded-xl border border-slate-200 px-4 py-3 text-sm outline-none focus:border-emerald-500"
-              />
+              <form onSubmit={searchAllUsers} className="flex flex-wrap gap-2">
+                <input
+                  value={keyword}
+                  onChange={(event) => setKeyword(event.target.value)}
+                  placeholder="LINE 暱稱、訊息或 UID，例如：天"
+                  className="min-w-64 flex-1 rounded-xl border border-slate-200 px-4 py-3 text-sm outline-none focus:border-emerald-500"
+                />
+                <button type="submit" disabled={loading || fetchingMore}
+                  className="rounded-xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white disabled:opacity-50">
+                  全庫搜尋
+                </button>
+                {searchMode && (
+                  <button type="button" onClick={() => void clearSearch()} disabled={loading}
+                    className="rounded-xl border border-slate-300 px-4 py-3 text-sm font-bold disabled:opacity-50">
+                    清除搜尋
+                  </button>
+                )}
+              </form>
             </div>
           </div>
 
+          {searchInfo && (
+            <p className="mt-4 rounded-xl bg-blue-50 px-4 py-3 text-sm text-blue-800">{searchInfo}</p>
+          )}
           <div className="mt-6 space-y-4">
             {loading ? (
               <div className="py-12 text-center text-sm text-slate-500">
@@ -299,7 +346,9 @@ export default function BindPostpaidLinePage() {
                   目前沒有符合條件的 LINE 使用者
                 </p>
                 <p className="mt-2 text-sm text-slate-500">
-                  請先讓客人傳一則訊息給 LINE 官方帳號。
+                  {searchMode
+                    ? "找不到符合的已存檔資料；請確認名稱、搜尋限制，或讓客人重新傳訊息給官方帳號。"
+                    : "可按「載入更多」，或輸入名稱後按「全庫搜尋」。"}
                 </p>
               </div>
             ) : (
@@ -430,16 +479,18 @@ export default function BindPostpaidLinePage() {
             )}
           </div>
           <div className="mt-6 flex flex-wrap justify-center gap-3">
-            {hasMore && (
+            {!searchMode && hasMore && (
               <button type="button" disabled={fetchingMore}
                 onClick={() => void loadPage(cursor)}
                 className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold disabled:opacity-50">
                 {fetchingMore ? "載入中..." : "載入更多 LINE 使用者（50 筆）"}
               </button>
             )}
-            <button type="button" onClick={() => void loadPage(null, true)}
-              className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">
-              重新整理已載入名單
+            <button type="button"
+              onClick={() => void loadPage(null, true, searchMode ? searchedKeyword : "")}
+              disabled={loading || fetchingMore}
+              className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold disabled:opacity-50">
+              {searchMode ? "重新搜尋" : "重新整理已載入名單"}
             </button>
           </div>
         </section>
