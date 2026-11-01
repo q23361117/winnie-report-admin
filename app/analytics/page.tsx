@@ -1,5 +1,4 @@
 "use client";
-
 import Link from "next/link";
 import {
   useCallback,
@@ -7,12 +6,10 @@ import {
   useMemo,
   useState,
 } from "react";
-
 type DispatcherItem = {
   name: string;
   count: number;
 };
-
 type AnalyticsPeriod = {
   rideCount: number;
   totalFare: number;
@@ -25,7 +22,6 @@ type AnalyticsPeriod = {
   unassignedCount: number;
   dispatcherRanking: DispatcherItem[];
 };
-
 type DashboardData = {
   analytics?: {
     today?: AnalyticsPeriod;
@@ -33,24 +29,20 @@ type DashboardData = {
   };
   lastUpdated?: string;
 };
-
 type ApiResponse = {
   success: boolean;
   data?: DashboardData;
   message?: string;
 };
-
 type ArchiveMonth = {
   month: string;
   archived?: boolean;
 };
-
 type ArchiveListResponse = {
   success: boolean;
   months?: ArchiveMonth[];
   message?: string;
 };
-
 type ArchiveDocument = {
   month?: string;
   archived?: boolean;
@@ -58,15 +50,12 @@ type ArchiveDocument = {
   createdAt?: unknown;
   status?: string;
   reportUrl?: string;
-
-  // 我們目前封存 API 的完整快照放在這裡
+  // 歷史月份 API 會回傳該月份 Google Sheet 封存副本的統計資料
   data?: DashboardData;
-
   // 保留相容性
   analytics?: DashboardData["analytics"];
   lastUpdated?: string;
 };
-
 type ArchiveDetailResponse = {
   success: boolean;
   month?: string;
@@ -74,9 +63,14 @@ type ArchiveDetailResponse = {
   data?: ArchiveDocument;
   message?: string;
 };
-
+type ArchiveActionResponse = {
+  success: boolean;
+  month?: string;
+  archived?: boolean;
+  message?: string;
+  data?: unknown;
+};
 const LIVE_VALUE = "live";
-
 function money(value: number) {
   return new Intl.NumberFormat("zh-TW", {
     style: "currency",
@@ -84,12 +78,10 @@ function money(value: number) {
     maximumFractionDigits: 0,
   }).format(Number(value || 0));
 }
-
 function formatClock(date: Date | null) {
   if (!date) {
     return "尚未同步";
   }
-
   return new Intl.DateTimeFormat("zh-TW", {
     timeZone: "Asia/Taipei",
     hour: "2-digit",
@@ -98,19 +90,15 @@ function formatClock(date: Date | null) {
     hour12: false,
   }).format(date);
 }
-
 function formatMonthLabel(month: string) {
   const match = /^(\d{4})-(\d{2})$/.exec(month);
-
   if (!match) {
     return month;
   }
-
   return `${Number(match[1])} 年 ${Number(
     match[2]
   )} 月`;
 }
-
 function getCurrentMonth() {
   const parts = new Intl.DateTimeFormat(
     "en-CA",
@@ -120,18 +108,24 @@ function getCurrentMonth() {
       month: "2-digit",
     }
   ).formatToParts(new Date());
-
   const year =
     parts.find((item) => item.type === "year")
       ?.value ?? "";
-
   const month =
     parts.find((item) => item.type === "month")
       ?.value ?? "";
-
   return `${year}-${month}`;
 }
-
+function getPreviousMonth(month: string) {
+  const [yearText, monthText] = month.split("-");
+  let year = Number(yearText);
+  let monthNumber = Number(monthText) - 1;
+  if (monthNumber === 0) {
+    year -= 1;
+    monthNumber = 12;
+  }
+  return `${year}-${String(monthNumber).padStart(2, "0")}`;
+}
 async function fetchLiveAnalytics(): Promise<DashboardData> {
   const response = await fetch(
     `/api/dashboard?_live=${Date.now()}`,
@@ -143,27 +137,22 @@ async function fetchLiveAnalytics(): Promise<DashboardData> {
       },
     }
   );
-
   const result =
     (await response.json()) as ApiResponse;
-
   if (!response.ok) {
     throw new Error(
       result.message ||
         `Dashboard API 回傳錯誤：${response.status}`
     );
   }
-
   if (!result.success || !result.data) {
     throw new Error(
       result.message ||
         "Dashboard API 沒有回傳有效資料"
     );
   }
-
   return result.data;
 }
-
 async function fetchArchiveMonths(): Promise<
   ArchiveMonth[]
 > {
@@ -177,23 +166,19 @@ async function fetchArchiveMonths(): Promise<
       },
     }
   );
-
   const result =
     (await response.json()) as ArchiveListResponse;
-
   if (!response.ok) {
     throw new Error(
       result.message ||
         `歷史月份 API 回傳錯誤：${response.status}`
     );
   }
-
   if (!result.success) {
     throw new Error(
       result.message || "讀取歷史月份失敗"
     );
   }
-
   return Array.isArray(result.months)
     ? result.months
         .filter(
@@ -208,7 +193,6 @@ async function fetchArchiveMonths(): Promise<
         )
     : [];
 }
-
 async function fetchArchiveAnalytics(
   month: string
 ): Promise<DashboardData> {
@@ -224,28 +208,23 @@ async function fetchArchiveAnalytics(
       },
     }
   );
-
   const result =
     (await response.json()) as ArchiveDetailResponse;
-
   if (!response.ok) {
     throw new Error(
       result.message ||
         `歷史報表 API 回傳錯誤：${response.status}`
     );
   }
-
   if (!result.success || !result.data) {
     throw new Error(
       result.message ||
         `找不到 ${month} 的歷史報表`
     );
   }
-
   const archive = result.data;
-
   /*
-   * 目前你的 Firebase 結構：
+   * 歷史月份資料來源：
    *
    * reportArchives
    *   └─ 2026-09
@@ -253,17 +232,16 @@ async function fetchArchiveAnalytics(
    *           └─ analytics
    *               └─ month
    *
-   * 因此正常會走 archive.data。
+   * /api/report-archives/[month] 會讀取 Google Sheet 歷史封存副本，正常會走 archive.data。
    *
-   * 後面的 archive.analytics 是為了未來
-   * 若調整封存格式仍可相容。
+   * 後面的 archive.analytics 是為了舊格式相容，
+   * 不作為目前歷史報表的主要資料來源。
    */
   if (
     archive.data?.analytics?.month
   ) {
     return archive.data;
   }
-
   if (archive.analytics?.month) {
     return {
       analytics: archive.analytics,
@@ -272,57 +250,49 @@ async function fetchArchiveAnalytics(
         `${formatMonthLabel(month)} 歷史封存`,
     };
   }
-
   throw new Error(
     `${formatMonthLabel(
       month
     )} 的封存資料缺少 analytics.month`
   );
 }
-
 export default function AnalyticsPage() {
   const [data, setData] =
     useState<DashboardData | null>(null);
-
   const [loading, setLoading] =
     useState(true);
-
   const [refreshing, setRefreshing] =
     useState(false);
-
   const [error, setError] = useState("");
-
   const [lastFetchedAt, setLastFetchedAt] =
     useState<Date | null>(null);
-
   const [selectedMonth, setSelectedMonth] =
     useState(LIVE_VALUE);
-
   const [archiveMonths, setArchiveMonths] =
     useState<ArchiveMonth[]>([]);
-
   const [monthsLoading, setMonthsLoading] =
     useState(true);
-
+  const [archiving, setArchiving] =
+    useState(false);
+  const [archiveMessage, setArchiveMessage] =
+    useState("");
   const isLive =
     selectedMonth === LIVE_VALUE;
-
   const currentMonth = getCurrentMonth();
-
+  // 換月封存：目前是 10 月時，工作表仍是 9 月，因此封存上一個月份。
+  const archiveTargetMonth = getPreviousMonth(currentMonth);
+  const archiveNextMonth = currentMonth;
   const selectedLabel = isLive
     ? `${formatMonthLabel(
         currentMonth
       )}｜目前報表`
     : formatMonthLabel(selectedMonth);
-
   const loadArchiveMonths =
     useCallback(async () => {
       try {
         setMonthsLoading(true);
-
         const months =
           await fetchArchiveMonths();
-
         setArchiveMonths(months);
       } catch (err) {
         console.error(
@@ -333,13 +303,11 @@ export default function AnalyticsPage() {
         setMonthsLoading(false);
       }
     }, []);
-
   const loadData = useCallback(
     async (showLoading = false) => {
       if (showLoading) {
         setLoading(true);
       }
-
       try {
         const result =
           selectedMonth === LIVE_VALUE
@@ -347,7 +315,6 @@ export default function AnalyticsPage() {
             : await fetchArchiveAnalytics(
                 selectedMonth
               );
-
         setData(result);
         setError("");
         setLastFetchedAt(new Date());
@@ -356,7 +323,6 @@ export default function AnalyticsPage() {
           "讀取調度與財務資料失敗：",
           err
         );
-
         setError(
           err instanceof Error
             ? err.message
@@ -369,51 +335,93 @@ export default function AnalyticsPage() {
     },
     [selectedMonth]
   );
-
   useEffect(() => {
     void loadArchiveMonths();
   }, [loadArchiveMonths]);
-
   useEffect(() => {
     setData(null);
     setError("");
-
     void loadData(true);
-
     /*
      * 只有目前報表才每 5 秒同步。
-     * 歷史報表是 Firebase 快照，
+     * 歷史報表讀取該月份的 Google Sheet 歷史封存副本，
      * 不需要一直重新讀取。
      */
     if (!isLive) {
       return;
     }
-
     const timer = window.setInterval(() => {
       void loadData(false);
     }, 5000);
-
     return () => {
       window.clearInterval(timer);
     };
   }, [isLive, loadData]);
-
   async function handleRefresh() {
     if (refreshing) {
       return;
     }
-
     setRefreshing(true);
-
     await Promise.all([
       loadData(false),
       loadArchiveMonths(),
     ]);
   }
-
+  async function handleArchiveCurrentMonth() {
+    if (!isLive || archiving) return;
+    if (!data || error) {
+      window.alert("目前即時報表尚未正常取得，請先確認 Google 報表同步正常後再封存。");
+      return;
+    }
+    const archiveTargetLabel = formatMonthLabel(archiveTargetMonth);
+    const nextMonthLabel = formatMonthLabel(archiveNextMonth);
+    const existingArchive = archiveMonths.find(
+      (item) => item.month === archiveTargetMonth && item.archived === true
+    );
+    const confirmed = window.confirm(
+      existingArchive
+        ? `⚠️ ${archiveTargetLabel}報表已經封存過！\n\n如果繼續，系統會重新建立封存並進入 ${nextMonthLabel}。\n\n確定要繼續嗎？`
+        : `確定要封存 ${archiveTargetLabel}報表並開啟 ${nextMonthLabel}嗎？\n\n系統會先建立完整 Google 試算表封存副本並驗證。\n驗證成功後，才會清理原工作報表的上月資料。\n原本工作報表網址維持不變。`
+    );
+    if (!confirmed) return;
+    try {
+      setArchiving(true);
+      setArchiveMessage("");
+      setError("");
+      const response = await fetch("/api/archive-month", {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          month: archiveTargetMonth,
+          force: Boolean(existingArchive),
+        }),
+      });
+      const result = (await response.json()) as ArchiveActionResponse;
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || `封存 API 回傳錯誤：${response.status}`);
+      }
+      await loadArchiveMonths();
+      await loadData(false);
+      const successMessage = `✅ ${archiveTargetLabel}報表封存完成，工作報表已開啟 ${nextMonthLabel}。`;
+      setArchiveMessage(successMessage);
+      window.alert(
+        `${successMessage}\n\nGoogle 試算表封存副本已建立並驗證。\n調度可繼續使用原本的 Google 試算表網址。`
+      );
+    } catch (err) {
+      console.error("封存報表並換月失敗：", err);
+      const message = err instanceof Error ? err.message : "封存報表並換月失敗";
+      setArchiveMessage(`❌ ${message}`);
+      setError(message);
+    } finally {
+      setArchiving(false);
+    }
+  }
   const analytics =
     data?.analytics?.month;
-
   const cards = useMemo(
     () => [
       {
@@ -491,10 +499,8 @@ export default function AnalyticsPage() {
     ],
     [analytics, isLive, selectedMonth]
   );
-
   const ranking =
     analytics?.dispatcherRanking ?? [];
-
   const maxCount =
     ranking.length > 0
       ? Math.max(
@@ -503,32 +509,26 @@ export default function AnalyticsPage() {
           )
         )
       : 1;
-
   const connected =
     Boolean(data) && !error;
-
   return (
     <main className="min-h-screen bg-[#f4f7fb] text-slate-900">
       <div className="flex min-h-screen">
         {/* 左側選單 */}
-
         <aside className="hidden w-64 shrink-0 bg-[#0f1b2d] px-5 py-6 text-white lg:block">
           <div className="flex items-center gap-3 px-2">
             <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-blue-500 text-xl">
               🚕
             </div>
-
             <div>
               <p className="text-lg font-bold">
                 維尼車隊
               </p>
-
               <p className="text-xs text-slate-400">
                 營運管理系統
               </p>
             </div>
           </div>
-
           <nav className="mt-10 space-y-2">
             <Link
               href="/"
@@ -536,35 +536,30 @@ export default function AnalyticsPage() {
             >
               ▦　營運總覽
             </Link>
-
             <Link
               href="/analytics"
               className="block rounded-xl bg-blue-500 px-4 py-3 text-sm font-medium text-white shadow-lg"
             >
               ◫　調度與財務
             </Link>
-
             <Link
               href="/members"
               className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
             >
               ♙　會員管理
             </Link>
-
             <Link
               href="/points"
               className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
             >
               ☆　集點紀錄
             </Link>
-
             <Link
               href="/postpaid"
               className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
             >
               ▤　後結帳務
             </Link>
-
             <Link
               href="/credits"
               className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
@@ -572,9 +567,7 @@ export default function AnalyticsPage() {
               ▭　乘車金管理
             </Link>
           </nav>
-
           {/* 左下狀態 */}
-
           <div className="mt-10 rounded-2xl border border-white/10 bg-white/5 p-4">
             <div className="flex items-center gap-2">
               <span
@@ -588,7 +581,6 @@ export default function AnalyticsPage() {
                       : "bg-red-400"
                 }`}
               />
-
               <p className="text-sm font-semibold">
                 {connected
                   ? isLive
@@ -599,38 +591,31 @@ export default function AnalyticsPage() {
                     : "連線異常"}
               </p>
             </div>
-
             <p className="mt-2 text-xs leading-5 text-slate-400">
               {isLive
                 ? "目前月份由 Google 報表每 5 秒自動同步。"
                 : `${formatMonthLabel(
                     selectedMonth
-                  )} 已從 Firebase 歷史封存讀取。`}
+                  )} 已從 Google Sheet 歷史封存副本讀取。`}
             </p>
-
             <p className="mt-2 text-[11px] text-slate-500">
               最後抓取：
               {formatClock(lastFetchedAt)}
             </p>
           </div>
         </aside>
-
         {/* 右側內容 */}
-
         <section className="min-w-0 flex-1">
           {/* 手機頂部 */}
-
           <div className="flex items-center justify-between border-b border-slate-200 bg-white px-5 py-4 lg:hidden">
             <div>
               <p className="font-bold">
                 維尼車隊
               </p>
-
               <p className="text-xs text-slate-500">
                 調度與財務分析
               </p>
             </div>
-
             <Link
               href="/"
               className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-blue-600"
@@ -638,24 +623,19 @@ export default function AnalyticsPage() {
               營運總覽
             </Link>
           </div>
-
           <div className="mx-auto max-w-7xl px-5 py-7 md:px-8">
             {/* 標題 */}
-
             <header className="mb-7 flex flex-col justify-between gap-5 xl:flex-row xl:items-start">
               <div>
                 <p className="text-sm font-semibold text-blue-600">
                   報表分析中心
                 </p>
-
                 <h1 className="mt-1 text-3xl font-bold">
                   調度與財務分析
                 </h1>
-
                 <p className="mt-2 text-sm text-slate-500">
                   查看目前月份及歷史月份的調度派單排行與各項財務金額
                 </p>
-
                 <div className="mt-4 flex flex-wrap items-center gap-3">
                   <span
                     className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-bold ${
@@ -679,7 +659,6 @@ export default function AnalyticsPage() {
                             : "bg-red-500"
                       }`}
                     />
-
                     {connected
                       ? isLive
                         ? "5 秒同步中"
@@ -688,23 +667,19 @@ export default function AnalyticsPage() {
                         ? "正在讀取"
                         : "連線異常"}
                   </span>
-
                   <span className="text-xs text-slate-400">
                     {isLive
                       ? "Google 報表每 5 秒自動同步"
-                      : "Firebase 歷史報表快照"}
+                      : "Google Sheet 歷史封存副本"}
                   </span>
                 </div>
               </div>
-
               <div className="flex flex-col gap-3 sm:flex-row sm:items-stretch">
                 {/* 月份選擇 */}
-
                 <div className="min-w-[220px] rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
                   <p className="text-xs font-medium text-slate-400">
                     報表月份
                   </p>
-
                   <select
                     value={selectedMonth}
                     onChange={(event) => {
@@ -721,7 +696,6 @@ export default function AnalyticsPage() {
                       )}{" "}
                       ｜目前報表
                     </option>
-
                     {archiveMonths.map(
                       (item) => (
                         <option
@@ -739,23 +713,19 @@ export default function AnalyticsPage() {
                     )}
                   </select>
                 </div>
-
                 {/* 資料來源 */}
-
                 <div className="min-w-[190px] rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
                   <p className="text-xs text-slate-400">
                     {isLive
                       ? "Apps Script 回報"
                       : "歷史報表"}
                   </p>
-
                   <p className="mt-1 text-sm font-semibold">
                     {isLive
                       ? data?.lastUpdated ??
                         "尚未取得資料"
                       : selectedLabel}
                   </p>
-
                   <p className="mt-1 text-[11px] text-slate-400">
                     本頁抓取：
                     {formatClock(
@@ -763,7 +733,24 @@ export default function AnalyticsPage() {
                     )}
                   </p>
                 </div>
-
+                {isLive && (
+                  <button
+                    type="button"
+                    onClick={handleArchiveCurrentMonth}
+                    disabled={
+                      archiving ||
+                      loading ||
+                      !data ||
+                      Boolean(error)
+                    }
+                    className="self-center rounded-xl bg-[#0f1b2d] px-4 py-3 text-sm font-bold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50 sm:self-stretch"
+                    title={`封存 ${formatMonthLabel(archiveTargetMonth)} 並開啟 ${formatMonthLabel(archiveNextMonth)}`}
+                  >
+                    {archiving
+                      ? "封存中..."
+                      : `📦 封存 ${formatMonthLabel(archiveTargetMonth)}`}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleRefresh}
@@ -787,9 +774,7 @@ export default function AnalyticsPage() {
                 </button>
               </div>
             </header>
-
             {/* 目前查看月份提示 */}
-
             <section
               className={`mb-5 rounded-2xl border p-4 ${
                 isLive
@@ -814,7 +799,6 @@ export default function AnalyticsPage() {
                           selectedMonth
                         )}歷史封存`}
                   </p>
-
                   <p
                     className={`mt-1 text-xs ${
                       isLive
@@ -824,10 +808,9 @@ export default function AnalyticsPage() {
                   >
                     {isLive
                       ? "資料持續由目前使用中的 Google 試算表同步。"
-                      : "此資料來自 Firebase 封存，不會因之後清空 Google 試算表而改變。"}
+                      : "此資料來自該月份的 Google Sheet 歷史封存副本，不受目前工作報表內容變動影響。"}
                   </p>
                 </div>
-
                 {!isLive && (
                   <button
                     type="button"
@@ -843,23 +826,38 @@ export default function AnalyticsPage() {
                 )}
               </div>
             </section>
-
+            {/* 封存結果 */}
+            {archiveMessage && (
+              <section
+                className={`mb-5 rounded-2xl border p-4 ${
+                  archiveMessage.startsWith("✅")
+                    ? "border-emerald-200 bg-emerald-50"
+                    : "border-red-200 bg-red-50"
+                }`}
+              >
+                <p
+                  className={`text-sm font-bold ${
+                    archiveMessage.startsWith("✅")
+                      ? "text-emerald-700"
+                      : "text-red-700"
+                  }`}
+                >
+                  {archiveMessage}
+                </p>
+              </section>
+            )}
             {/* 錯誤 */}
-
             {error && (
               <section className="mb-5 rounded-2xl border border-red-200 bg-red-50 p-4">
                 <p className="text-sm font-bold text-red-700">
                   ⚠️ 調度與財務資料目前無法讀取
                 </p>
-
                 <p className="mt-1 text-xs text-red-600">
                   {error}
                 </p>
               </section>
             )}
-
             {/* 載入 */}
-
             {loading && !data && (
               <section className="mb-5 rounded-2xl border border-blue-100 bg-blue-50 p-4">
                 <p className="text-sm font-semibold text-blue-700">
@@ -871,9 +869,7 @@ export default function AnalyticsPage() {
                 </p>
               </section>
             )}
-
             {/* 財務卡片 */}
-
             <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               {cards.map((card) => (
                 <article
@@ -883,25 +879,20 @@ export default function AnalyticsPage() {
                   <p className="text-sm font-medium text-slate-500">
                     {card.title}
                   </p>
-
                   <p className="mt-4 text-3xl font-bold tracking-tight">
                     {loading && !data
                       ? "—"
                       : card.value}
                   </p>
-
                   <p className="mt-5 border-t border-slate-100 pt-4 text-xs text-slate-400">
                     {card.note}
                   </p>
                 </article>
               ))}
             </section>
-
             {/* 排行與摘要 */}
-
             <section className="mt-5 grid gap-5 xl:grid-cols-[1.4fr_0.6fr]">
               {/* 排行 */}
-
               <article className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200/70">
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -912,12 +903,10 @@ export default function AnalyticsPage() {
                             selectedMonth
                           )}調度派單排行`}
                     </h2>
-
                     <p className="mt-1 text-sm text-slate-500">
                       依所選月份有效派車單量排序
                     </p>
                   </div>
-
                   <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-600">
                     共{" "}
                     {analytics?.rideCount ??
@@ -925,7 +914,6 @@ export default function AnalyticsPage() {
                     單
                   </span>
                 </div>
-
                 <div className="mt-6 space-y-4">
                   {loading && !data ? (
                     <div className="rounded-2xl bg-slate-50 px-5 py-10 text-center text-sm text-slate-400">
@@ -945,7 +933,6 @@ export default function AnalyticsPage() {
                                 maxCount) *
                               100
                             : 0;
-
                         return (
                           <div
                             key={`${item.name}-${index}`}
@@ -955,7 +942,6 @@ export default function AnalyticsPage() {
                               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-sm font-bold text-slate-600">
                                 {index + 1}
                               </div>
-
                               <div className="min-w-0 flex-1">
                                 <div className="flex items-center justify-between gap-3">
                                   <p
@@ -970,7 +956,6 @@ export default function AnalyticsPage() {
                                       item.name
                                     }
                                   </p>
-
                                   <p className="font-bold">
                                     {
                                       item.count
@@ -978,7 +963,6 @@ export default function AnalyticsPage() {
                                     單
                                   </p>
                                 </div>
-
                                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
                                   <div
                                     className={`h-full rounded-full ${
@@ -1001,9 +985,7 @@ export default function AnalyticsPage() {
                   )}
                 </div>
               </article>
-
               {/* 摘要 */}
-
               <article className="rounded-3xl bg-[#0f1b2d] p-6 text-white shadow-sm">
                 <p className="text-sm font-medium text-slate-400">
                   {isLive
@@ -1012,7 +994,6 @@ export default function AnalyticsPage() {
                         selectedMonth
                       )}財務摘要`}
                 </p>
-
                 <p className="mt-3 text-4xl font-bold">
                   {loading && !data
                     ? "—"
@@ -1021,11 +1002,9 @@ export default function AnalyticsPage() {
                           0
                       )}
                 </p>
-
                 <p className="mt-2 text-sm text-slate-400">
                   所選月份有效派車總車資
                 </p>
-
                 <div className="mt-7 space-y-4 border-t border-white/10 pt-6">
                   <SummaryRow
                     label="後結"
@@ -1034,7 +1013,6 @@ export default function AnalyticsPage() {
                         0
                     )}
                   />
-
                   <SummaryRow
                     label="回扣"
                     value={money(
@@ -1042,7 +1020,6 @@ export default function AnalyticsPage() {
                         0
                     )}
                   />
-
                   <SummaryRow
                     label="取消費"
                     value={money(
@@ -1050,7 +1027,6 @@ export default function AnalyticsPage() {
                         0
                     )}
                   />
-
                   <SummaryRow
                     label="代收"
                     value={money(
@@ -1058,7 +1034,6 @@ export default function AnalyticsPage() {
                         0
                     )}
                   />
-
                   <SummaryRow
                     label="乘車金"
                     value={money(
@@ -1066,7 +1041,6 @@ export default function AnalyticsPage() {
                         0
                     )}
                   />
-
                   <SummaryRow
                     label="折扣"
                     value={money(
@@ -1075,20 +1049,16 @@ export default function AnalyticsPage() {
                     )}
                   />
                 </div>
-
                 {!isLive && (
                   <div className="mt-7 rounded-2xl border border-white/10 bg-white/5 p-4">
                     <p className="text-xs font-semibold text-blue-300">
                       📦 歷史封存
                     </p>
-
                     <p className="mt-2 text-xs leading-5 text-slate-400">
                       {formatMonthLabel(
                         selectedMonth
                       )}
-                      的數據已保存於
-                      Firebase，不受目前 Google
-                      報表內容變動影響。
+                      的數據來自該月份的 Google Sheet 歷史封存副本，不受目前工作報表內容變動影響。
                     </p>
                   </div>
                 )}
@@ -1100,7 +1070,6 @@ export default function AnalyticsPage() {
     </main>
   );
 }
-
 function SummaryRow({
   label,
   value,
@@ -1113,7 +1082,6 @@ function SummaryRow({
       <span className="text-sm text-slate-400">
         {label}
       </span>
-
       <span className="font-semibold">
         {value}
       </span>
