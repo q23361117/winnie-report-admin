@@ -1,12 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   collection,
   getCountFromServer,
-  onSnapshot,
+  getDocs,
   query,
   where,
   Timestamp,
@@ -391,7 +391,7 @@ export default function Home() {
     useState<DashboardData | null>(null);
 
   const [dashboardLoading, setDashboardLoading] =
-    useState(true);
+    useState(false);
 
   const [dashboardError, setDashboardError] =
     useState("");
@@ -407,10 +407,6 @@ export default function Home() {
   ------------------------------------------------------- */
 
   const [memberCount, setMemberCount] = useState(0);
-
-  // 台灣日期變換時重建今日／本月範圍監聽。
-  const [taipeiDay, setTaipeiDay] = useState(() => getTaipeiDateKey(new Date()));
-  const [taipeiMonth, setTaipeiMonth] = useState(() => getTaipeiMonthKey(new Date()));
 
   const [pointTransactions, setPointTransactions] =
     useState<PointTransactionRecord[]>([]);
@@ -443,272 +439,86 @@ export default function Home() {
   const [firestoreLastUpdated, setFirestoreLastUpdated] =
     useState<Date | null>(null);
 
-  const mountedRef = useRef(true);
+  const queryingRef = useRef(false);
+  const [hasQueried, setHasQueried] = useState(false);
 
-  /* =======================================================
-     Google 試算表 5 秒自動同步
-  ======================================================= */
-
-  useEffect(() => {
-    mountedRef.current = true;
-
-    let running = false;
-
-    const loadDashboard = async (
-      showLoading = false
-    ) => {
-      if (running) {
-        return;
-      }
-
-      running = true;
-
-      if (showLoading) {
-        setDashboardLoading(true);
-      }
-
-      try {
-        const data =
-          await fetchDashboardData();
-
-        if (!mountedRef.current) {
-          return;
-        }
-
-        setDashboard(data);
-
-        setDashboardError("");
-
-        setDashboardLastFetch(
-          new Date()
-        );
-      } catch (error) {
-        console.error(
-          "讀取 Google 試算表失敗：",
-          error
-        );
-
-        if (!mountedRef.current) {
-          return;
-        }
-
-        setDashboardError(
-          error instanceof Error
-            ? error.message
-            : "讀取 Google 試算表失敗"
-        );
-      } finally {
-        if (mountedRef.current) {
-          setDashboardLoading(false);
-          setDashboardRefreshing(false);
-        }
-
-        running = false;
-      }
-    };
-
-    void loadDashboard(true);
-
-    /**
-     * 每 5 秒自動更新 Google Sheet
-     *
-     * Firestore 不需要這個，
-     * 因為 Firestore 是 onSnapshot 真正即時監聽。
-     */
-    const timer = window.setInterval(() => {
-      void loadDashboard(false);
-    }, 5000);
-
-    return () => {
-      mountedRef.current = false;
-
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  /* =======================================================
-     Firestore 低讀取版本
-     - 會員僅使用 count 聚合，每 15 分鐘更新
-     - 今日點數僅監聽台灣當日交易
-     - 本月乘車金僅監聽台灣當月交易
-     - 保留後結帳務原本的即時監聽
-  ======================================================= */
-
-  useEffect(() => {
-    // 本地時鐘輪詢不會向 Firestore 發出請求。
-    const updateCalendar = () => {
-      const now = new Date();
-      setTaipeiDay(getTaipeiDateKey(now));
-      setTaipeiMonth(getTaipeiMonthKey(now));
-    };
-    const timer = window.setInterval(updateCalendar, 60_000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    let running = false;
-    const refreshMembers = async () => {
-      if (running || document.visibilityState === "hidden") return;
-      running = true;
-      try {
-        const result = await getCountFromServer(collection(db, "members"));
-        if (cancelled) return;
-        setMemberCount(result.data().count);
-        setMembersLoaded(true);
-        setFirestoreLastUpdated(new Date());
-      } catch (error) {
-        if (cancelled) return;
-        console.error("會員數量讀取失敗：", error);
-        setMembersLoaded(false);
-        setFirestoreError("會員數量查詢失敗，請檢查 Firestore 配額或權限。");
-      } finally {
-        running = false;
-      }
-    };
-    void refreshMembers();
-    const timer = window.setInterval(() => void refreshMembers(), 15 * 60_000);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void refreshMembers();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, []);
-
-  useEffect(() => {
-    // YYYY-MM-DD 的台灣午夜相當於前一日 16:00 UTC。
-    const start = Timestamp.fromDate(new Date(`${taipeiDay}T00:00:00+08:00`));
-    const endDate = new Date(start.toMillis() + 24 * 60 * 60 * 1000);
-    const end = Timestamp.fromDate(endDate);
+  /* 所有資料均由管理員按鈕觸發；首頁載入不訂閱 Firestore。 */
+  async function handleManualRefresh() {
+    if (queryingRef.current) return;
+    queryingRef.current = true;
+    setHasQueried(true);
+    setDashboardRefreshing(true);
+    setDashboardLoading(true);
+    setDashboardError("");
+    setFirestoreError("");
+    setMembersLoaded(false);
     setPointsLoaded(false);
-    const unsubscribe = onSnapshot(
-      query(
-        collection(db, "pointTransactions"),
-        where("createdAt", ">=", start),
-        where("createdAt", "<", end)
-      ),
-      (snapshot) => {
-        setPointTransactions(snapshot.docs.map((document) => {
-          const data = document.data();
-          return {
-            id: document.id,
-            points: toSafeNumber(data.points),
-            status: String(data.status ?? "active"),
-            createdAt: getDateFromValue(data.createdAt),
-          };
-        }));
-        setPointsLoaded(true);
-        setFirestoreLastUpdated(new Date());
-      },
-      (error) => {
-        console.error("今日集點監聽失敗：", error);
-        setPointsLoaded(false);
-        setFirestoreError("今日集點資料查詢失敗，請檢查 Firestore 額度或權限。");
-      }
-    );
-    return unsubscribe;
-  }, [taipeiDay]);
-
-  useEffect(() => {
-    const [year, month] = taipeiMonth.split("-").map(Number);
-    const start = Timestamp.fromDate(new Date(Date.UTC(year, month - 1, 1) - 8 * 60 * 60 * 1000));
-    const end = Timestamp.fromDate(new Date(Date.UTC(year, month, 1) - 8 * 60 * 60 * 1000));
     setCreditsLoaded(false);
-    const unsubscribe = onSnapshot(
-      query(
-        collection(db, "rideCreditTransactions"),
-        where("createdAt", ">=", start),
-        where("createdAt", "<", end)
-      ),
-      (snapshot) => {
-        setRideCreditTransactions(snapshot.docs.map((document) => {
-          const data = document.data();
-          return {
-            id: document.id,
-            amount: toSafeNumber(data.amount),
-            status: String(data.status ?? "active"),
-            createdAt: getDateFromValue(data.createdAt),
-          };
-        }));
+    setPostpaidLoaded(false);
+
+    const now = new Date();
+    const day = getTaipeiDateKey(now);
+    const monthKey = getTaipeiMonthKey(now);
+    const [year, month] = monthKey.split("-").map(Number);
+    const dayStart = Timestamp.fromDate(new Date(`${day}T00:00:00+08:00`));
+    const dayEnd = Timestamp.fromMillis(dayStart.toMillis() + 86400000);
+    const monthStart = Timestamp.fromDate(new Date(Date.UTC(year, month - 1, 1) - 8 * 3600000));
+    const monthEnd = Timestamp.fromDate(new Date(Date.UTC(year, month, 1) - 8 * 3600000));
+
+    // 一次性並行查詢；不持續監聽、不自動重試。
+    const results = await Promise.allSettled([
+      fetchDashboardData(),
+      getCountFromServer(collection(db, "members")),
+      getDocs(query(collection(db, "pointTransactions"), where("createdAt", ">=", dayStart), where("createdAt", "<", dayEnd))),
+      getDocs(query(collection(db, "rideCreditTransactions"), where("createdAt", ">=", monthStart), where("createdAt", "<", monthEnd))),
+      getDocs(collection(db, "postpaidCustomers")),
+    ]);
+
+    const errors: string[] = [];
+    try {
+      const [sheet, members, points, credits, postpaid] = results;
+      if (sheet.status === "fulfilled") {
+        setDashboard(sheet.value);
+        setDashboardLastFetch(new Date());
+      } else {
+        setDashboard(null);
+        setDashboardError(sheet.reason instanceof Error ? sheet.reason.message : "Google 報表查詢失敗");
+      }
+      if (members.status === "fulfilled") {
+        setMemberCount(members.value.data().count);
+        setMembersLoaded(true);
+      } else { setMemberCount(0); errors.push("會員數量查詢失敗"); }
+      if (points.status === "fulfilled") {
+        setPointTransactions(points.value.docs.map(doc => ({
+          id: doc.id, points: toSafeNumber(doc.data().points),
+          status: String(doc.data().status ?? "active"),
+          createdAt: getDateFromValue(doc.data().createdAt),
+        })));
+        setPointsLoaded(true);
+      } else { setPointTransactions([]); errors.push("今日集點查詢失敗"); }
+      if (credits.status === "fulfilled") {
+        setRideCreditTransactions(credits.value.docs.map(doc => ({
+          id: doc.id, amount: toSafeNumber(doc.data().amount),
+          status: String(doc.data().status ?? "active"),
+          createdAt: getDateFromValue(doc.data().createdAt),
+        })));
         setCreditsLoaded(true);
-        setFirestoreLastUpdated(new Date());
-      },
-      (error) => {
-        console.error("本月乘車金監聽失敗：", error);
-        setCreditsLoaded(false);
-        setFirestoreError("本月乘車金資料查詢失敗，請檢查 Firestore 額度或權限。");
-      }
-    );
-    return unsubscribe;
-  }, [taipeiMonth]);
-
-  /* =======================================================
-     Firestore：後結帳務即時監聽
-  ======================================================= */
-
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(
-        db,
-        "postpaidCustomers"
-      ),
-
-      (snapshot) => {
-        const rows =
-          snapshot.docs.map(
-            (document) => {
-              const data =
-                document.data();
-
-              return {
-                id: document.id,
-
-                balance:
-                  toSafeNumber(
-                    data.balance
-                  ),
-
-                status: String(
-                  data.status ??
-                    "active"
-                ),
-              };
-            }
-          );
-
-        setPostpaidCustomers(
-          rows
-        );
-
+      } else { setRideCreditTransactions([]); errors.push("本月乘車金查詢失敗"); }
+      if (postpaid.status === "fulfilled") {
+        setPostpaidCustomers(postpaid.value.docs.map(doc => ({
+          id: doc.id, balance: toSafeNumber(doc.data().balance),
+          status: String(doc.data().status ?? "active"),
+        })));
         setPostpaidLoaded(true);
-
-        setFirestoreError("");
-
-        setFirestoreLastUpdated(
-          new Date()
-        );
-      },
-
-      (error) => {
-        console.error(
-          "後結帳務即時監聽失敗：",
-          error
-        );
-
-        setPostpaidLoaded(false);
-
-        setFirestoreError(
-          "Firestore 部分資料監聽失敗，請檢查權限或網路。"
-        );
-      }
-    );
-
-    return unsubscribe;
-  }, []);
+      } else { setPostpaidCustomers([]); errors.push("後結客戶查詢失敗"); }
+      setFirestoreError(errors.join("；"));
+      if (errors.length === 0) setFirestoreLastUpdated(new Date());
+    } finally {
+      setDashboardLoading(false);
+      setDashboardRefreshing(false);
+      queryingRef.current = false;
+    }
+  }
 
   /* =======================================================
      Firestore 即時計算
@@ -723,7 +533,7 @@ export default function Home() {
 
   const todayPoints =
     useMemo(() => {
-      const now = new Date();
+      const now = firestoreLastUpdated ?? new Date();
 
       const todayKey =
         getTaipeiDateKey(now);
@@ -758,7 +568,7 @@ export default function Home() {
         },
         0
       );
-    }, [pointTransactions]);
+    }, [pointTransactions, firestoreLastUpdated]);
 
   const monthRewardAmount =
     useMemo(() => {
@@ -802,7 +612,7 @@ export default function Home() {
         0
       );
     }, [
-      rideCreditTransactions,
+      rideCreditTransactions, firestoreLastUpdated,
     ]);
 
   const activePostpaidCustomers =
@@ -941,8 +751,8 @@ export default function Home() {
     firestoreConnected;
 
   const realtimeLabel =
-    overallConnected
-      ? "即時監控中"
+    !hasQueried ? "尚未查詢" : overallConnected
+      ? "本次查詢完成"
       : dashboardLoading
         ? "正在連線"
         : "部分服務異常";
@@ -955,13 +765,11 @@ export default function Home() {
     {
       title: "會員總數",
 
-      value: String(
-        memberCount
-      ),
+      value: membersLoaded ? String(memberCount) : "—",
 
       note: firestoreConnected
         ? "Firestore 會員數量定期統計（約 15 分鐘）"
-        : "正在連接會員資料庫",
+        : "尚未查詢或查詢失敗",
 
       live: false,
 
@@ -984,13 +792,11 @@ export default function Home() {
     {
       title: "今日新增點數",
 
-      value: String(
-        todayPoints
-      ),
+      value: pointsLoaded ? String(todayPoints) : "—",
 
       note: firestoreConnected
-        ? "今天有效集點紀錄即時加總（限當日）"
-        : "正在連接集點紀錄",
+        ? "本次查詢的今日有效集點加總"
+        : "尚未查詢或查詢失敗",
 
       live: true,
 
@@ -1010,15 +816,13 @@ export default function Home() {
     {
       title: "後結客戶",
 
-      value: String(
-        postpaidCustomerCount
-      ),
+      value: postpaidLoaded ? String(postpaidCustomerCount) : "—",
 
       note: firestoreConnected
         ? `目前帳務餘額合計 ${formatMoney(
             postpaidTotalBalance
           )}`
-        : "正在連接後結客戶資料",
+        : "尚未查詢或查詢失敗",
 
       live: true,
 
@@ -1042,13 +846,11 @@ export default function Home() {
     {
       title: "本月轉換乘車金",
 
-      value: formatMoney(
-        monthRewardAmount
-      ),
+      value: creditsLoaded ? formatMoney(monthRewardAmount) : "—",
 
       note: firestoreConnected
-        ? "本月有效乘車金入帳即時加總（限當月）"
-        : "正在連接乘車金資料",
+        ? "本次查詢的本月有效乘車金加總"
+        : "尚未查詢或查詢失敗",
 
       live: true,
 
@@ -1074,50 +876,6 @@ export default function Home() {
       ),
     },
   ];
-
-  /* =======================================================
-     手動同步
-  ======================================================= */
-
-  async function handleManualRefresh() {
-    if (
-      dashboardRefreshing
-    ) {
-      return;
-    }
-
-    setDashboardRefreshing(
-      true
-    );
-
-    try {
-      const data =
-        await fetchDashboardData();
-
-      setDashboard(data);
-
-      setDashboardError("");
-
-      setDashboardLastFetch(
-        new Date()
-      );
-    } catch (error) {
-      console.error(
-        "手動同步失敗：",
-        error
-      );
-
-      setDashboardError(
-        error instanceof Error
-          ? error.message
-          : "同步失敗"
-      );
-    } finally {
-      setDashboardRefreshing(
-        false
-      );
-    }
-  }
 
   /* =======================================================
      UI
@@ -1272,7 +1030,7 @@ export default function Home() {
 
               {overallConnected
                 ? `正在監控「${sheetName}」與 Firestore。`
-                : "正在確認報表與 Firebase 連線狀態。"}
+                : "點擊「查詢營運資料」以取得最新資料。"}
 
             </p>
 
@@ -1379,7 +1137,7 @@ export default function Home() {
                   查看車隊單量、會員集點、後結帳務與乘車金使用狀況
                 </p>
 
-                {/* LIVE */}
+                {/* 已查詢 */}
 
                 <div className="mt-4 flex flex-wrap items-center gap-3">
 
@@ -1410,11 +1168,11 @@ export default function Home() {
                   </div>
 
                   <span className="text-xs text-slate-400">
-                    Google 報表每 5 秒自動同步
+                    按下查詢才讀取 Google 報表
                   </span>
 
                   <span className="text-xs text-slate-400">
-                    Firestore 範圍監聽／定期統計
+                    Firestore 僅按需查詢
                   </span>
 
                 </div>
@@ -1476,9 +1234,9 @@ export default function Home() {
                   disabled={
                     dashboardRefreshing
                   }
-                  className="flex h-12 w-12 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  aria-label="立即同步"
-                  title="立即同步資料"
+                  className="flex h-12 min-w-36 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-label="查詢營運資料"
+                  title="查詢營運資料"
                 >
 
                   <svg
@@ -1496,6 +1254,7 @@ export default function Home() {
                     <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5" />
                   </svg>
 
+                  <span className="text-sm font-semibold">{dashboardRefreshing ? "查詢中..." : "查詢營運資料"}</span>
                 </button>
 
               </div>
@@ -1564,7 +1323,7 @@ export default function Home() {
                         </p>
 
                         <span className="rounded-full bg-white/15 px-2 py-0.5 text-[10px] font-bold text-white">
-                          5 秒同步
+                          手動查詢
                         </span>
 
                       </div>
@@ -1576,7 +1335,7 @@ export default function Home() {
                           {dashboardLoading &&
                           !dashboard
                             ? "—"
-                            : todayCount}
+                            : (!dashboard ? "—" : todayCount)}
 
                         </span>
 
@@ -1659,7 +1418,7 @@ export default function Home() {
                         </p>
 
                         <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-bold text-blue-600">
-                          5 秒同步
+                          手動查詢
                         </span>
 
                       </div>
@@ -1671,7 +1430,7 @@ export default function Home() {
                           {dashboardLoading &&
                           !dashboard
                             ? "—"
-                            : monthCount}
+                            : (!dashboard ? "—" : monthCount)}
 
                         </span>
 
@@ -1757,7 +1516,7 @@ export default function Home() {
 
                           {stat.live && (
                             <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600">
-                              LIVE
+                              已查詢
                             </span>
                           )}
 
@@ -1811,11 +1570,11 @@ export default function Home() {
                   <div>
 
                     <p className="text-sm font-bold text-emerald-900">
-                      Firestore 即時監控
+                      Firestore 按需查詢
                     </p>
 
                     <p className="mt-2 text-sm leading-6 text-emerald-700">
-                      會員數定期彙總；當日集點、本月乘車金與後結帳務使用限縮範圍的 Firestore 監聽。
+                      點擊查詢才讀取會員、集點、乘車金與後結資料，不維持即時監聽。
                     </p>
 
                   </div>
@@ -1828,8 +1587,8 @@ export default function Home() {
                     }`}
                   >
                     {firestoreConnected
-                      ? "LIVE"
-                      : "連線中"}
+                      ? "已查詢"
+                      : "尚未查詢"}
                   </span>
 
                 </div>
@@ -1858,7 +1617,7 @@ export default function Home() {
                     </p>
 
                     <p className="mt-2 text-sm leading-6 text-blue-700">
-                      今日單量與本月單量每 5 秒重新向 Apps Script 取得最新資料。
+                      管理員點擊查詢後，才向 Apps Script 取得最新資料。
                     </p>
 
                   </div>
@@ -1871,7 +1630,7 @@ export default function Home() {
                     }`}
                   >
                     {isConnected
-                      ? "5 SEC"
+                      ? "手動"
                       : "異常"}
                   </span>
 
@@ -1916,8 +1675,8 @@ export default function Home() {
                       }`}
                     >
                       {overallConnected
-                        ? "即時監控中"
-                        : "正在確認"}
+                        ? "本次查詢完成"
+                        : "尚未查詢"}
                     </span>
 
                   </div>
@@ -1925,7 +1684,7 @@ export default function Home() {
                   <p className="mt-2 text-sm text-slate-500">
 
                     {overallConnected
-                      ? "Google 試算表採 5 秒快速同步，Firestore 使用低讀取統計與限縮監聽。"
+                      ? "Google 試算表採 5 秒快速同步，Firestore 只在手動查詢時讀取。"
                       : "部分服務正在連線或發生異常，請查看下方狀態。"}
 
                   </p>
@@ -1964,7 +1723,7 @@ export default function Home() {
                   title="Google 試算表"
                   description={
                     isConnected
-                      ? `目前同步分頁：${sheetName}｜每 5 秒自動更新`
+                      ? `目前同步分頁：${sheetName}｜手動查詢`
                       : dashboardError ||
                         "無法讀取每日派車報表"
                   }
@@ -1982,13 +1741,13 @@ export default function Home() {
                   title="會員集點系統"
                   description={
                     firestoreConnected
-                      ? `目前共有 ${memberCount} 位會員，Firestore 會員統計約每 15 分鐘更新。`
-                      : "目前正在連接 Firestore 會員與集點資料。"
+                      ? `目前共有 ${memberCount} 位會員，Firestore 會員數手動查詢。`
+                      : "尚未查詢或查詢失敗。"
                   }
                   status={
                     firestoreConnected
                       ? "即時監控"
-                      : "連線中"
+                      : "尚未查詢"
                   }
                   connected={
                     firestoreConnected
