@@ -442,6 +442,51 @@ export default function Home() {
   const queryingRef = useRef(false);
   const [hasQueried, setHasQueried] = useState(false);
 
+  // 系統狀態單獨檢查：不啟動 Firestore onSnapshot 或計時輪詢。
+  const [checkingStatus, setCheckingStatus] = useState(false);
+  const statusBusyRef = useRef(false);
+  const [statusCheckedAt, setStatusCheckedAt] = useState<Date | null>(null);
+  const [sheetHealth, setSheetHealth] = useState<"unknown" | "ok" | "error">("unknown");
+  const [firebaseHealth, setFirebaseHealth] = useState<"unknown" | "ok" | "error">("unknown");
+  const [healthDetails, setHealthDetails] = useState<DashboardData | null>(null);
+  const [healthMessage, setHealthMessage] = useState("");
+
+  async function handleCheckStatus() {
+    if (statusBusyRef.current || queryingRef.current) return;
+    statusBusyRef.current = true;
+    setCheckingStatus(true);
+    setHealthMessage("");
+    // 獨立檢查：Google 使用既有 Dashboard API；Firebase 用 count 聚合而非整個集合。
+    // 不更新營運統計卡片，也不寫入任何會員、後結或點數交易。
+    try {
+      const [sheetResult, firebaseResult] = await Promise.allSettled([
+        fetchDashboardData(),
+        getCountFromServer(collection(db, "members")),
+      ]);
+      if (sheetResult.status === "fulfilled") {
+        setSheetHealth("ok");
+        setHealthDetails(sheetResult.value);
+      } else {
+        setSheetHealth("error");
+        setHealthDetails(null);
+      }
+      setFirebaseHealth(firebaseResult.status === "fulfilled" ? "ok" : "error");
+      setStatusCheckedAt(new Date());
+      if (sheetResult.status === "rejected" || firebaseResult.status === "rejected") {
+        const names = [
+          sheetResult.status === "rejected" ? "Google 報表" : "",
+          firebaseResult.status === "rejected" ? "Firebase" : "",
+        ].filter(Boolean).join("、");
+        setHealthMessage(`${names} 檢查失敗；詳細資訊請查看伺服器與 Firebase 記錄。`);
+      }
+    } catch (error) {
+      setHealthMessage(error instanceof Error ? error.message : "系統檢查失敗");
+    } finally {
+      setCheckingStatus(false);
+      statusBusyRef.current = false;
+    }
+  }
+
   /* 所有資料均由管理員按鈕觸發；首頁載入不訂閱 Firestore。 */
   async function handleManualRefresh() {
     if (queryingRef.current) return;
@@ -668,7 +713,7 @@ export default function Home() {
   ======================================================= */
 
   const memberSync =
-    dashboard?.memberSync;
+    healthDetails?.memberSync ?? dashboard?.memberSync;
 
   const lineNotified =
     Number(
@@ -688,16 +733,13 @@ export default function Home() {
         0
     );
 
+  // 這只是 Apps Script 上次回報的「功能啟用」資訊，不是 LINE 即時連線探測。
   const lineConnected =
-    Boolean(dashboard) &&
-    Boolean(
-      memberSync?.enabled
-    ) &&
-    lineErrors === 0;
+    Boolean(memberSync?.enabled) && lineErrors === 0;
 
   const lineDescription =
-    !dashboard
-      ? "目前無法讀取 Apps Script 報表 API。"
+    !healthDetails && !dashboard
+      ? "尚未取得 Apps Script 的同步回報。"
       : !memberSync
         ? "Apps Script 尚未回傳 LINE 通知狀態。"
         : lineErrors > 0
@@ -709,7 +751,7 @@ export default function Home() {
   ======================================================= */
 
   const postpaidSync =
-    dashboard?.postpaidSync;
+    healthDetails?.postpaidSync ?? dashboard?.postpaidSync;
 
   const postpaidSyncErrors =
     Number(
@@ -717,16 +759,13 @@ export default function Home() {
         0
     );
 
+  // 此欄反映最近一次 API 回報的同步功能設定，非即時交易健康檢查。
   const postpaidConnected =
-    Boolean(dashboard) &&
-    Boolean(
-      postpaidSync?.enabled
-    ) &&
-    postpaidSyncErrors === 0;
+    Boolean(postpaidSync?.enabled) && postpaidSyncErrors === 0;
 
   const postpaidDescription =
-    !dashboard
-      ? "目前無法讀取 Apps Script 報表 API。"
+    !healthDetails && !dashboard
+      ? "尚未取得 Apps Script 的同步回報。"
       : !postpaidSync
         ? "Apps Script 尚未回傳後結帳務同步狀態。"
         : postpaidSyncErrors > 0
@@ -751,11 +790,13 @@ export default function Home() {
     firestoreConnected;
 
   const realtimeLabel =
-    !hasQueried ? "尚未查詢" : overallConnected
-      ? "本次查詢完成"
-      : dashboardLoading
-        ? "正在連線"
-        : "部分服務異常";
+    dashboardLoading ? "正在查詢" : !hasQueried ? "尚未查詢" : overallConnected
+      ? "本次查詢完成" : "部分資料查詢失敗";
+
+  const statusSummary =
+    checkingStatus ? "檢查中" : !statusCheckedAt ? "尚未檢查"
+      : sheetHealth === "ok" && firebaseHealth === "ok"
+        ? "本次檢查成功" : "部分檢查失敗";
 
   /* =======================================================
      統計卡片
@@ -768,7 +809,7 @@ export default function Home() {
       value: membersLoaded ? String(memberCount) : "—",
 
       note: firestoreConnected
-        ? "Firestore 會員數量定期統計（約 15 分鐘）"
+        ? "Firestore 會員數量按需查詢"
         : "尚未查詢或查詢失敗",
 
       live: false,
@@ -1029,7 +1070,7 @@ export default function Home() {
             <p className="mt-2 text-xs leading-5 text-slate-400">
 
               {overallConnected
-                ? `正在監控「${sheetName}」與 Firestore。`
+                ? `上次查詢「${sheetName}」與 Firestore 已完成，資料不會自動刷新。`
                 : "點擊「查詢營運資料」以取得最新資料。"}
 
             </p>
@@ -1684,11 +1725,21 @@ export default function Home() {
                   <p className="mt-2 text-sm text-slate-500">
 
                     {overallConnected
-                      ? "Google 試算表採 5 秒快速同步，Firestore 只在手動查詢時讀取。"
+                      ? "Google 報表與 Firestore 只在管理員按鈕操作時查詢。"
                       : "部分服務正在連線或發生異常，請查看下方狀態。"}
 
                   </p>
 
+                </div>
+
+                <div className="flex flex-col items-start gap-2">
+                  <button type="button" onClick={handleCheckStatus}
+                    disabled={checkingStatus || dashboardRefreshing}
+                    className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                    {checkingStatus ? "檢查中..." : "檢查系統狀態"}
+                  </button>
+                  <p className="text-xs text-slate-500">{statusSummary}｜{formatTaipeiDateTime(statusCheckedAt)}</p>
+                  {healthMessage && <p className="max-w-xs text-xs text-red-600">{healthMessage}</p>}
                 </div>
 
                 <div className="text-right">
@@ -1717,79 +1768,33 @@ export default function Home() {
 
               </div>
 
+              <p className="mt-3 text-xs text-slate-500">LINE 與後結狀態是 Apps Script 最近一次回報，並非即時服務連通性測試。</p>
               <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
 
                 <StatusCard
                   title="Google 試算表"
-                  description={
-                    isConnected
-                      ? `目前同步分頁：${sheetName}｜手動查詢`
-                      : dashboardError ||
-                        "無法讀取每日派車報表"
-                  }
-                  status={
-                    isConnected
-                      ? "快速同步"
-                      : "連接失敗"
-                  }
-                  connected={
-                    isConnected
-                  }
+                  description={sheetHealth === "ok" ? `本次 API 回應成功，分頁：${healthDetails?.sheetName ?? "未指定"}` : sheetHealth === "error" ? "本次 Google 報表檢查失敗" : "尚未檢查"}
+                  status={sheetHealth === "unknown" ? "尚未檢查" : sheetHealth === "ok" ? "本次成功" : "本次失敗"}
+                  connected={sheetHealth === "ok"}
                 />
-
                 <StatusCard
-                  title="會員集點系統"
-                  description={
-                    firestoreConnected
-                      ? `目前共有 ${memberCount} 位會員，Firestore 會員數手動查詢。`
-                      : "尚未查詢或查詢失敗。"
-                  }
-                  status={
-                    firestoreConnected
-                      ? "即時監控"
-                      : "尚未查詢"
-                  }
-                  connected={
-                    firestoreConnected
-                  }
+                  title="Firebase 資料庫"
+                  description={firebaseHealth === "ok" ? "會員數聚合查詢成功；不代表其他集合均正常" : firebaseHealth === "error" ? "會員數聚合查詢失敗，請檢查配額與權限" : "尚未檢查"}
+                  status={firebaseHealth === "unknown" ? "尚未檢查" : firebaseHealth === "ok" ? "本次成功" : "本次失敗"}
+                  connected={firebaseHealth === "ok"}
                 />
-
                 <StatusCard
                   title="後結帳務系統"
-                  description={
-                    postpaidDescription
-                  }
-                  status={
-                    postpaidConnected
-                      ? "已啟用"
-                      : postpaidSyncErrors >
-                          0
-                        ? "同步異常"
-                        : "尚未確認"
-                  }
-                  connected={
-                    postpaidConnected
-                  }
+                  description={postpaidDescription}
+                  status={!postpaidSync ? "未取得回報" : postpaidConnected ? "上次回報正常" : "需確認"}
+                  connected={postpaidConnected}
                 />
-
                 <StatusCard
                   title="LINE 官方通知"
-                  description={
-                    lineDescription
-                  }
-                  status={
-                    lineConnected
-                      ? "已連接"
-                      : lineErrors >
-                          0
-                        ? "通知異常"
-                        : "尚未確認"
-                  }
-                  connected={
-                    lineConnected
-                  }
+                  description={lineDescription}
+                  status={!memberSync ? "未取得回報" : lineConnected ? "上次回報正常" : "需確認"}
+                  connected={lineConnected}
                 />
-
               </div>
 
             </section>
