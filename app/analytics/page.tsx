@@ -260,7 +260,7 @@ export default function AnalyticsPage() {
   const [data, setData] =
     useState<DashboardData | null>(null);
   const [loading, setLoading] =
-    useState(true);
+    useState(false);
   const [refreshing, setRefreshing] =
     useState(false);
   const [error, setError] = useState("");
@@ -271,7 +271,7 @@ export default function AnalyticsPage() {
   const [archiveMonths, setArchiveMonths] =
     useState<ArchiveMonth[]>([]);
   const [monthsLoading, setMonthsLoading] =
-    useState(true);
+    useState(false);
   const [archiving, setArchiving] =
     useState(false);
   const [archiveMessage, setArchiveMessage] =
@@ -335,38 +335,24 @@ export default function AnalyticsPage() {
     },
     [selectedMonth]
   );
-  useEffect(() => {
-    void loadArchiveMonths();
-  }, [loadArchiveMonths]);
+  // 不在初次開頁或切換月份時自動讀取任何後台資料。
+  // 只清除畫面中的舊結果，避免把上個月數據誤當成本月。
   useEffect(() => {
     setData(null);
     setError("");
-    void loadData(true);
-    /*
-     * 只有目前報表才每 5 秒同步。
-     * 歷史報表讀取該月份的 Google Sheet 歷史封存副本，
-     * 不需要一直重新讀取。
-     */
-    if (!isLive) {
-      return;
-    }
-    const timer = window.setInterval(() => {
-      void loadData(false);
-    }, 5000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [isLive, loadData]);
+    setLastFetchedAt(null);
+  }, [selectedMonth]);
+
   async function handleRefresh() {
-    if (refreshing) {
-      return;
-    }
+    if (refreshing || loading || archiving) return;
     setRefreshing(true);
-    await Promise.all([
-      loadData(false),
-      loadArchiveMonths(),
-    ]);
+    try {
+      await loadData(true);
+    } finally {
+      setRefreshing(false);
+    }
   }
+
   async function handleArchiveCurrentMonth() {
     if (!isLive || archiving) return;
     if (!data || error) {
@@ -584,16 +570,16 @@ export default function AnalyticsPage() {
               <p className="text-sm font-semibold">
                 {connected
                   ? isLive
-                    ? "5 秒同步中"
+                    ? "已手動查詢"
                     : "歷史報表"
                   : loading
                     ? "正在讀取"
-                    : "連線異常"}
+                    : error ? "連線異常" : "尚未查詢"}
               </p>
             </div>
             <p className="mt-2 text-xs leading-5 text-slate-400">
               {isLive
-                ? "目前月份由 Google 報表每 5 秒自動同步。"
+                ? "僅在點選查詢時讀取 Google 報表。"
                 : `${formatMonthLabel(
                     selectedMonth
                   )} 已從 Google Sheet 歷史封存副本讀取。`}
@@ -661,15 +647,15 @@ export default function AnalyticsPage() {
                     />
                     {connected
                       ? isLive
-                        ? "5 秒同步中"
+                        ? "已手動查詢"
                         : "歷史封存"
                       : loading
                         ? "正在讀取"
-                        : "連線異常"}
+                        : error ? "連線異常" : "尚未查詢"}
                   </span>
                   <span className="text-xs text-slate-400">
                     {isLive
-                      ? "Google 報表每 5 秒自動同步"
+                      ? "按需查詢，不自動輪詢"
                       : "Google Sheet 歷史封存副本"}
                   </span>
                 </div>
@@ -687,7 +673,7 @@ export default function AnalyticsPage() {
                         event.target.value
                       );
                     }}
-                    disabled={monthsLoading}
+                    disabled={monthsLoading || loading}
                     className="mt-1 w-full cursor-pointer bg-transparent text-sm font-bold text-slate-800 outline-none"
                   >
                     <option value={LIVE_VALUE}>
@@ -713,6 +699,14 @@ export default function AnalyticsPage() {
                     )}
                   </select>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => void loadArchiveMonths()}
+                  disabled={monthsLoading || archiving}
+                  className="self-center rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-bold text-slate-700 shadow-sm disabled:opacity-50 sm:self-stretch"
+                >
+                  {monthsLoading ? "載入月份中..." : "載入歷史月份"}
+                </button>
                 {/* 資料來源 */}
                 <div className="min-w-[190px] rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
                   <p className="text-xs text-slate-400">
@@ -754,23 +748,11 @@ export default function AnalyticsPage() {
                 <button
                   type="button"
                   onClick={handleRefresh}
-                  disabled={refreshing}
-                  className="flex h-12 w-12 self-center items-center justify-center rounded-xl border border-slate-200 bg-white text-xl shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-auto"
-                  title={
-                    isLive
-                      ? "立即重新同步"
-                      : "重新讀取歷史報表"
-                  }
+                  disabled={refreshing || loading || archiving}
+                  className="self-center rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white shadow-sm hover:bg-blue-700 disabled:opacity-50 sm:self-stretch"
+                  title="只有點擊才會向 Google 試算表查詢資料"
                 >
-                  <span
-                    className={
-                      refreshing
-                        ? "animate-spin"
-                        : ""
-                    }
-                  >
-                    ↻
-                  </span>
+                  {refreshing || loading ? "查詢中..." : "🔎 查詢報表"}
                 </button>
               </div>
             </header>
@@ -807,7 +789,7 @@ export default function AnalyticsPage() {
                     }`}
                   >
                     {isLive
-                      ? "資料持續由目前使用中的 Google 試算表同步。"
+                      ? "本頁僅在按下查詢按鈕後讀取 Google 試算表。"
                       : "此資料來自該月份的 Google Sheet 歷史封存副本，不受目前工作報表內容變動影響。"}
                   </p>
                 </div>
@@ -880,9 +862,7 @@ export default function AnalyticsPage() {
                     {card.title}
                   </p>
                   <p className="mt-4 text-3xl font-bold tracking-tight">
-                    {loading && !data
-                      ? "—"
-                      : card.value}
+                    {!data ? "—" : card.value}
                   </p>
                   <p className="mt-5 border-t border-slate-100 pt-4 text-xs text-slate-400">
                     {card.note}
@@ -922,7 +902,7 @@ export default function AnalyticsPage() {
                   ) : ranking.length ===
                     0 ? (
                     <div className="rounded-2xl bg-slate-50 px-5 py-10 text-center text-sm text-slate-400">
-                      尚未取得調度資料
+                      {!data ? "請按『查詢報表』取得資料" : "尚未取得調度資料"}
                     </div>
                   ) : (
                     ranking.map(
@@ -995,7 +975,7 @@ export default function AnalyticsPage() {
                       )}財務摘要`}
                 </p>
                 <p className="mt-3 text-4xl font-bold">
-                  {loading && !data
+                  {!data
                     ? "—"
                     : money(
                         analytics?.totalFare ??
