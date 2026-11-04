@@ -1,4 +1,4 @@
-import crypto from "crypto";
+import crypto from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
@@ -12,348 +12,182 @@ type LineSource = {
   groupId?: string;
   roomId?: string;
 };
-
-type LineMessage = {
-  id?: string;
+type LineMessage = { id?: string; type?: string; text?: string };
+type LineEvent = {
   type?: string;
-  text?: string;
-};
-
-type LineWebhookEvent = {
-  type?: string;
+  webhookEventId?: string;
   timestamp?: number;
   source?: LineSource;
   message?: LineMessage;
-  postback?: {
-    data?: string;
-  };
+  postback?: { data?: string };
 };
-
-type LineWebhookBody = {
-  destination?: string;
-  events?: LineWebhookEvent[];
-};
-
-type LineProfile = {
+type LineBody = { events?: LineEvent[] };
+type Profile = {
   displayName?: string;
   pictureUrl?: string;
   statusMessage?: string;
 };
 
-function verifyLineSignature(
-  rawBody: string,
-  signature: string | null
-) {
-  const channelSecret = process.env.LINE_CHANNEL_SECRET;
+const PROFILE_REFRESH_MS = 24 * 60 * 60 * 1000;
+const COLLECTION = "pendingLineUsers";
 
-  if (!channelSecret) {
-    throw new Error("缺少 LINE_CHANNEL_SECRET");
-  }
-
-  if (!signature) {
-    return false;
-  }
-
-  const expectedSignature = crypto
-    .createHmac("sha256", channelSecret)
-    .update(rawBody)
-    .digest("base64");
-
-  const receivedBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expectedSignature);
-
-  if (receivedBuffer.length !== expectedBuffer.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(
-    receivedBuffer,
-    expectedBuffer
-  );
+function verifySignature(body: string, signature: string | null): boolean {
+  const secret = process.env.LINE_CHANNEL_SECRET;
+  if (!secret || !signature) return false;
+  const expected = crypto.createHmac("sha256", secret).update(body).digest("base64");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signature);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function createDocumentId(lineUserId: string) {
-  return crypto
-    .createHash("sha256")
-    .update(lineUserId)
-    .digest("hex")
-    .slice(0, 40);
+function documentId(uid: string) {
+  return crypto.createHash("sha256").update(uid).digest("hex").slice(0, 40);
 }
 
-function getMessageDescription(event: LineWebhookEvent) {
+function normalize(value: unknown): string {
+  return typeof value === "string" ? value.normalize("NFKC").trim().toLowerCase() : "";
+}
+
+// 與後台搜尋 API 使用相同的索引規則。
+// 限制字元與索引數量，避免 LINE 長暱稱造成大量索引寫入。
+function searchTokens(values: unknown[]): string[] {
+  const tokens = new Set<string>();
+  for (const value of values) {
+    const s = normalize(value).slice(0, 36);
+    for (let i = 0; i < s.length && tokens.size < 240; i++) {
+      for (let j = i + 1; j <= Math.min(s.length, i + 24) && tokens.size < 240; j++) {
+        tokens.add(s.slice(i, j));
+      }
+    }
+  }
+  return [...tokens];
+}
+
+function getEventMessage(event: LineEvent) {
+  if (event.type === "follow") return { messageType: "follow", lastMessage: "【加入好友】", lastMessageId: "" };
+  if (event.type === "unfollow") return { messageType: "unfollow", lastMessage: "【封鎖或取消好友】", lastMessageId: "" };
+  if (event.type === "postback") return { messageType: "postback", lastMessage: "【選單操作】", lastMessageId: "" };
   const message = event.message;
-
-  if (event.type === "follow") {
-    return {
-      messageType: "follow",
-      lastMessage: "【加入好友】",
-      messageId: "",
-    };
-  }
-
-  if (event.type === "unfollow") {
-    return {
-      messageType: "unfollow",
-      lastMessage: "【封鎖或取消好友】",
-      messageId: "",
-    };
-  }
-
-  if (event.type === "postback") {
-    return {
-      messageType: "postback",
-      lastMessage:
-        event.postback?.data || "【選單操作】",
-      messageId: "",
-    };
-  }
-
-  if (!message) {
-    return {
-      messageType: event.type || "unknown",
-      lastMessage: "",
-      messageId: "",
-    };
-  }
-
-  if (message.type === "text") {
-    return {
-      messageType: "text",
-      lastMessage: String(message.text || "").slice(0, 500),
-      messageId: String(message.id || ""),
-    };
-  }
-
-  const labels: Record<string, string> = {
-    image: "圖片",
-    video: "影片",
-    audio: "語音",
-    file: "檔案",
-    location: "位置",
-    sticker: "貼圖",
+  if (!message) return { messageType: event.type || "unknown", lastMessage: "", lastMessageId: "" };
+  const type = String(message.type || "unknown");
+  const label: Record<string, string> = {
+    image: "圖片", video: "影片", audio: "語音", file: "檔案", location: "位置", sticker: "貼圖",
   };
-
   return {
-    messageType: String(message.type || "unknown"),
-    lastMessage: `【${
-      labels[String(message.type)] ||
-      String(message.type || "訊息")
-    }】`,
-    messageId: String(message.id || ""),
+    messageType: type,
+    lastMessage: type === "text" ? String(message.text || "").slice(0, 500) : `【${label[type] || type}】`,
+    lastMessageId: String(message.id || ""),
   };
 }
 
-async function getLineProfile(
-  lineUserId: string
-): Promise<LineProfile> {
-  const channelAccessToken =
-    process.env.LINE_CHANNEL_ACCESS_TOKEN;
+async function fetchProfile(uid: string): Promise<Profile> {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) throw new Error("缺少 LINE_CHANNEL_ACCESS_TOKEN");
+  const response = await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(uid)}`, {
+    headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
+    signal: AbortSignal.timeout(6000),
+  });
+  if (!response.ok) throw new Error(`LINE Profile HTTP ${response.status}`);
+  return (await response.json()) as Profile;
+}
 
-  if (!channelAccessToken) {
-    throw new Error(
-      "缺少 LINE_CHANNEL_ACCESS_TOKEN"
-    );
+async function processEvent(event: LineEvent): Promise<"stored" | "ignored"> {
+  const type = event.type || "";
+  if (!["message", "follow", "unfollow", "postback"].includes(type)) return "ignored";
+  const uid = String(event.source?.userId || "").trim();
+  if (!uid) return "ignored"; // 沒有 User ID 無法綁定
+
+  const ref = adminDb.collection(COLLECTION).doc(documentId(uid));
+  const before = await ref.get(); // 每次一個文件，不掃描集合
+  const old = before.data() || {};
+  const eventId = String(event.webhookEventId || "");
+  const info = getEventMessage(event);
+  const oldTimestamp = Number(old.rawTimestamp || 0);
+  const incomingTimestamp = Number(event.timestamp || 0);
+  if (eventId && old.lastWebhookEventId === eventId) return "ignored";
+  if (info.lastMessageId && old.lastMessageId === info.lastMessageId) return "ignored";
+  if (incomingTimestamp > 0 && oldTimestamp > incomingTimestamp) return "ignored";
+
+  const sourceType = String(event.source?.type || "user");
+  const update: Record<string, unknown> = {
+    lineUserId: uid,
+    sourceType,
+    groupId: String(event.source?.groupId || ""),
+    roomId: String(event.source?.roomId || ""),
+    eventType: type,
+    ...info,
+    rawTimestamp: incomingTimestamp || oldTimestamp,
+    lastSeenAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (!before.exists) {
+    update.firstSeenAt = FieldValue.serverTimestamp();
+    update.bindingStatus = "pending";
+    update.boundCustomerId = "";
+    update.boundCustomerCode = "";
+    update.boundCustomerName = "";
+    update.boundAt = null;
   }
+  if (eventId) update.lastWebhookEventId = eventId;
+  if (type === "follow") update.isFriend = true;
+  else if (type === "unfollow") update.isFriend = false;
+  else if (!before.exists && sourceType === "user") update.isFriend = true;
+  // 群組訊息不得用來推定使用者是官方好友
 
-  const response = await fetch(
-    `https://api.line.me/v2/bot/profile/${encodeURIComponent(
-      lineUserId
-    )}`,
-    {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${channelAccessToken}`,
-      },
-      cache: "no-store",
-    }
+  const lastProfileFetch = old.profileFetchedAt?.toMillis?.() || 0;
+  const needsProfile = type !== "unfollow" && (
+    !before.exists || !old.displayName || Date.now() - lastProfileFetch >= PROFILE_REFRESH_MS
   );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-
-    throw new Error(
-      `LINE Profile API 錯誤：${response.status} ${errorText}`
-    );
-  }
-
-  return (await response.json()) as LineProfile;
-}
-
-async function savePendingLineUser(
-  event: LineWebhookEvent
-) {
-  const source = event.source;
-  const lineUserId = String(source?.userId || "").trim();
-
-  if (!lineUserId) {
-    return;
-  }
-
-  const supportedTypes = [
-    "message",
-    "follow",
-    "unfollow",
-    "postback",
-  ];
-
-  if (
-    !event.type ||
-    !supportedTypes.includes(event.type)
-  ) {
-    return;
-  }
-
-  const documentId = createDocumentId(lineUserId);
-  const documentRef = adminDb
-    .collection("pendingLineUsers")
-    .doc(documentId);
-
-  const existingSnapshot = await documentRef.get();
-  const existingData = existingSnapshot.exists
-    ? existingSnapshot.data() || {}
-    : {};
-
-  let profile: LineProfile = {
-    displayName: String(existingData.displayName || ""),
-    pictureUrl: String(existingData.pictureUrl || ""),
-    statusMessage: String(
-      existingData.statusMessage || ""
-    ),
-  };
-
-  if (event.type !== "unfollow") {
+  if (needsProfile) {
     try {
-      profile = await getLineProfile(lineUserId);
+      const profile = await fetchProfile(uid);
+      const displayName = String(profile.displayName || old.displayName || "");
+      update.displayName = displayName;
+      update.pictureUrl = String(profile.pictureUrl || old.pictureUrl || "");
+      update.statusMessage = String(profile.statusMessage || old.statusMessage || "");
+      update.profileFetchedAt = FieldValue.serverTimestamp();
+      update.searchTokens = searchTokens([
+        displayName,
+        old.adminAlias || "",
+        old.boundCustomerCode || "",
+        old.boundCustomerName || "",
+      ]);
     } catch (error) {
-      console.error(
-        "取得 LINE 使用者資料失敗：",
-        error
-      );
+      console.warn("LINE Profile 取得失敗（仍會保存事件）", error instanceof Error ? error.message : error);
+      if (!before.exists) {
+        update.displayName = "";
+        update.pictureUrl = "";
+        update.statusMessage = "";
+        update.searchTokens = [];
+      }
     }
   }
-
-  const messageInfo = getMessageDescription(event);
-
-  await documentRef.set(
-    {
-      lineUserId,
-      displayName: String(profile.displayName || ""),
-      pictureUrl: String(profile.pictureUrl || ""),
-      statusMessage: String(
-        profile.statusMessage || ""
-      ),
-
-      sourceType: String(source?.type || "user"),
-      groupId: String(source?.groupId || ""),
-      roomId: String(source?.roomId || ""),
-
-      eventType: String(event.type || ""),
-      messageType: messageInfo.messageType,
-      lastMessage: messageInfo.lastMessage,
-      lastMessageId: messageInfo.messageId,
-
-      bindingStatus: String(
-        existingData.bindingStatus || "pending"
-      ),
-
-      boundCustomerId: String(
-        existingData.boundCustomerId || ""
-      ),
-
-      boundCustomerCode: String(
-        existingData.boundCustomerCode || ""
-      ),
-
-      boundCustomerName: String(
-        existingData.boundCustomerName || ""
-      ),
-
-      boundAt: existingData.boundAt || null,
-
-      isFriend: event.type !== "unfollow",
-
-      rawTimestamp: Number(event.timestamp || 0),
-
-      firstSeenAt:
-        existingData.firstSeenAt ||
-        FieldValue.serverTimestamp(),
-
-      lastSeenAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    {
-      merge: true,
-    }
-  );
+  // merge:true 不覆蓋既有後結綁定欄位
+  await ref.set(update, { merge: true });
+  return "stored";
 }
 
 export async function GET() {
-  return NextResponse.json({
-    success: true,
-    message: "LINE Webhook API 正常運作",
-  });
+  return NextResponse.json({ success: true, message: "LINE Webhook endpoint OK（不代表實際事件已寫入）" });
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const rawBody = await request.text();
-
-    const signature = request.headers.get(
-      "x-line-signature"
-    );
-
-    const validSignature = verifyLineSignature(
-      rawBody,
-      signature
-    );
-
-    if (!validSignature) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "LINE 簽章驗證失敗",
-        },
-        {
-          status: 401,
-        }
-      );
+    const bodyText = await request.text();
+    if (!verifySignature(bodyText, request.headers.get("x-line-signature"))) {
+      return NextResponse.json({ success: false, message: "LINE 簽章驗證失敗" }, { status: 401 });
     }
-
-    const body = JSON.parse(rawBody) as LineWebhookBody;
-
-    const events = Array.isArray(body.events)
-      ? body.events
-      : [];
-
-    await Promise.all(
-      events.map((event) =>
-        savePendingLineUser(event)
-      )
-    );
-
-    return NextResponse.json(
-      {
-        success: true,
-        received: events.length,
-      },
-      {
-        status: 200,
-      }
-    );
+    const body = JSON.parse(bodyText) as LineBody;
+    const events = Array.isArray(body.events) ? body.events : [];
+    let stored = 0;
+    // 順序處理，減少同一 UID 的並行覆蓋
+    for (const event of events) {
+      if ((await processEvent(event)) === "stored") stored++;
+    }
+    console.info("LINE_WEBHOOK_RECEIVED", { received: events.length, stored });
+    return NextResponse.json({ success: true, received: events.length, stored });
   } catch (error) {
-    console.error("LINE Webhook 處理失敗：", error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : "LINE Webhook 處理失敗",
-      },
-      {
-        status: 500,
-      }
-    );
+    console.error("LINE_WEBHOOK_ERROR", error);
+    return NextResponse.json({ success: false, message: "LINE Webhook 處理失敗" }, { status: 500 });
   }
 }
