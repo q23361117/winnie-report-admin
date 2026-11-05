@@ -31,12 +31,22 @@ function millis(value: unknown): number | undefined {
   return value && typeof value === "object" && "toMillis" in value && typeof value.toMillis === "function"
     ? value.toMillis() : undefined;
 }
+// 使用 Unicode code point 分割搜尋文字，避免把 emoji 的 surrogate pair 切成半個字元。
+// 不完整的 surrogate 字元會被略過，防止 Firestore 寫入 INVALID_ARGUMENT。
+function safeCodePoints(value: unknown, maxLength: number): string[] {
+  return Array.from(normalize(value))
+    .filter((char) => !/^[\uD800-\uDFFF]$/.test(char))
+    .slice(0, maxLength);
+}
+
 function tokenize(values: unknown[]): string[] {
   const set = new Set<string>();
   for (const value of values) {
-    const s = normalize(value).slice(0, 36);
-    for (let i = 0; i < s.length && set.size < 240; i++) {
-      for (let j = i + 1; j <= Math.min(s.length, i + 24) && set.size < 240; j++) set.add(s.slice(i, j));
+    const chars = safeCodePoints(value, 36);
+    for (let i = 0; i < chars.length && set.size < 240; i++) {
+      for (let j = i + 1; j <= Math.min(chars.length, i + 24) && set.size < 240; j++) {
+        set.add(chars.slice(i, j).join(""));
+      }
     }
   }
   return [...set];
@@ -221,7 +231,7 @@ export async function POST(request: NextRequest) {
   // 管理員可新增搜尋別名；不會改動 LINE 官方後台的自訂暱稱。
   if (action === "setAlias") {
     const pendingId = text(body.pendingId);
-    const alias = text(body.alias).trim().slice(0, 36);
+    const alias = safeCodePoints(body.alias, 36).join("");
     if (!pendingId || pendingId.includes("/")) return fail("無效的 LINE 文件", 400);
     try {
       const ref = pendingCollection.doc(pendingId);
