@@ -11,7 +11,7 @@ const pendingCollection = adminDb.collection("pendingLineUsers");
 const customerCollection = adminDb.collection("postpaidCustomers");
 const indexCollection = adminDb.collection("postpaidLineBindings");
 const PAGE_SIZE = 20;
-const INDEX_BATCH_SIZE = 25;
+const INDEX_BATCH_SIZE = 10;
 
 function fail(error: string, status: number) {
   return NextResponse.json({ success: false, error }, { status, headers: { "Cache-Control": "no-store" } });
@@ -150,32 +150,71 @@ export async function POST(request: NextRequest) {
   catch { return fail("JSON 格式錯誤", 400); }
   const action = text(body.action);
 
-  // 一次最多 25 筆；管理員手動點擊才執行，避免配額再次暴增。
+  // 僅在管理員點擊後執行。分批讀取，每份文件獨立更新，便於定位錯誤。
+  // 不修改 LINE 綁定、會員餘額或集點。
   if (action === "indexBatch") {
     const cursor = text(body.cursor);
     if (cursor.length > 100 || cursor.includes("/")) return fail("索引游標錯誤", 400);
+
+    let stage = "query";
+    let processed = 0;
+    let updated = 0;
+    let lastProcessedCursor: string | null = null;
     try {
       let query = pendingCollection.orderBy(FieldPath.documentId()).limit(INDEX_BATCH_SIZE);
       if (cursor) query = query.startAfter(cursor);
       const snap = await query.get();
-      const batch = adminDb.batch();
-      let updated = 0;
+
+      // 改為逐筆更新。若有某一筆資料不合法，不會讓整批的所有更新失敗。
+      // 遇到錯誤即停止，重試時會從上一筆成功處理的文件繼續。
       for (const doc of snap.docs) {
+        stage = "tokenize";
         const data = doc.data();
-        const tokens = tokenize([data.displayName, data.adminAlias, data.boundCustomerCode, data.boundCustomerName]);
+        const tokens = tokenize([
+          data.displayName, data.adminAlias, data.boundCustomerCode, data.boundCustomerName,
+        ]);
         if (JSON.stringify(data.searchTokens || []) !== JSON.stringify(tokens)) {
-          batch.update(doc.ref, { searchTokens: tokens });
+          stage = "write";
+          try {
+            await doc.ref.update({ searchTokens: tokens });
+          } catch (writeError) {
+            console.error("LINE_INDEX_BATCH_DOCUMENT_ERROR", {
+              stage,
+              // Firestore 文件 ID 不輸出到客戶端，避免洩漏個人識別資訊。
+              code: typeof writeError === "object" && writeError !== null && "code" in writeError
+                ? String(writeError.code) : "unknown",
+              message: writeError instanceof Error ? writeError.message : String(writeError),
+              tokenCount: tokens.length,
+            });
+            throw writeError;
+          }
           updated++;
         }
+        processed++;
+        lastProcessedCursor = doc.id;
       }
-      if (updated) await batch.commit();
-      return NextResponse.json({ success: true, processed: snap.size, updated,
-        nextCursor: snap.size ? snap.docs[snap.docs.length - 1].id : null,
+
+      return NextResponse.json({
+        success: true,
+        processed,
+        updated,
+        nextCursor: lastProcessedCursor,
         hasMore: snap.size === INDEX_BATCH_SIZE,
-      });
+      }, { headers: { "Cache-Control": "no-store" } });
     } catch (error) {
-      console.error("LINE_INDEX_BATCH_ERROR", error);
-      const e = errorMessage(error); return fail(e.message, e.status);
+      console.error("LINE_INDEX_BATCH_ERROR", {
+        stage,
+        processed,
+        updated,
+        code: typeof error === "object" && error !== null && "code" in error
+          ? String(error.code) : "unknown",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      const e = errorMessage(error);
+      return NextResponse.json({
+        success: false,
+        error: `${e.message}（階段：${stage}；已處理 ${processed} 筆）`,
+      }, { status: e.status, headers: { "Cache-Control": "no-store" } });
     }
   }
 
