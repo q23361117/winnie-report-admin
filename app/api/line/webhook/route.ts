@@ -30,6 +30,7 @@ type Profile = {
 
 const PROFILE_REFRESH_MS = 24 * 60 * 60 * 1000;
 const COLLECTION = "pendingLineUsers";
+const MAX_TOKENS = 240;
 
 function verifySignature(body: string, signature: string | null): boolean {
   const secret = process.env.LINE_CHANNEL_SECRET;
@@ -48,17 +49,28 @@ function normalize(value: unknown): string {
   return typeof value === "string" ? value.normalize("NFKC").trim().toLowerCase() : "";
 }
 
-// 與後台搜尋 API 使用相同的索引規則。
-// 限制字元與索引數量，避免 LINE 長暱稱造成大量索引寫入。
+/**
+ * Must stay in sync with tokenize() in app/api/postpaid/line-bindings/route.ts.
+ * Iterate by Unicode code point, never by UTF-16 code unit: splitting an emoji
+ * with String.slice(i, j) can create a lone surrogate rejected by Firestore.
+ */
 function searchTokens(values: unknown[]): string[] {
   const tokens = new Set<string>();
   for (const value of values) {
-    const s = normalize(value).slice(0, 36);
-    for (let i = 0; i < s.length && tokens.size < 240; i++) {
-      for (let j = i + 1; j <= Math.min(s.length, i + 24) && tokens.size < 240; j++) {
-        tokens.add(s.slice(i, j));
+    // Also discard any pre-existing malformed isolated surrogate code points.
+    const chars = Array.from(normalize(value))
+      .filter((ch) => {
+        const cp = ch.codePointAt(0);
+        return cp !== undefined && !(cp >= 0xd800 && cp <= 0xdfff);
+      })
+      .slice(0, 36);
+
+    for (let i = 0; i < chars.length && tokens.size < MAX_TOKENS; i++) {
+      for (let j = i + 1; j <= Math.min(chars.length, i + 24) && tokens.size < MAX_TOKENS; j++) {
+        tokens.add(chars.slice(i, j).join(""));
       }
     }
+    if (tokens.size >= MAX_TOKENS) break;
   }
   return [...tokens];
 }
@@ -95,10 +107,10 @@ async function processEvent(event: LineEvent): Promise<"stored" | "ignored"> {
   const type = event.type || "";
   if (!["message", "follow", "unfollow", "postback"].includes(type)) return "ignored";
   const uid = String(event.source?.userId || "").trim();
-  if (!uid) return "ignored"; // 沒有 User ID 無法綁定
+  if (!uid) return "ignored";
 
   const ref = adminDb.collection(COLLECTION).doc(documentId(uid));
-  const before = await ref.get(); // 每次一個文件，不掃描集合
+  const before = await ref.get(); // one document lookup, no full collection scan
   const old = before.data() || {};
   const eventId = String(event.webhookEventId || "");
   const info = getEventMessage(event);
@@ -132,37 +144,45 @@ async function processEvent(event: LineEvent): Promise<"stored" | "ignored"> {
   if (type === "follow") update.isFriend = true;
   else if (type === "unfollow") update.isFriend = false;
   else if (!before.exists && sourceType === "user") update.isFriend = true;
-  // 群組訊息不得用來推定使用者是官方好友
+  // A group event does not prove friendship with the official account.
 
   const lastProfileFetch = old.profileFetchedAt?.toMillis?.() || 0;
   const needsProfile = type !== "unfollow" && (
     !before.exists || !old.displayName || Date.now() - lastProfileFetch >= PROFILE_REFRESH_MS
   );
+  let displayName = String(old.displayName || "");
   if (needsProfile) {
     try {
       const profile = await fetchProfile(uid);
-      const displayName = String(profile.displayName || old.displayName || "");
+      displayName = String(profile.displayName || old.displayName || "");
       update.displayName = displayName;
       update.pictureUrl = String(profile.pictureUrl || old.pictureUrl || "");
       update.statusMessage = String(profile.statusMessage || old.statusMessage || "");
       update.profileFetchedAt = FieldValue.serverTimestamp();
-      update.searchTokens = searchTokens([
-        displayName,
-        old.adminAlias || "",
-        old.boundCustomerCode || "",
-        old.boundCustomerName || "",
-      ]);
     } catch (error) {
       console.warn("LINE Profile 取得失敗（仍會保存事件）", error instanceof Error ? error.message : error);
       if (!before.exists) {
         update.displayName = "";
         update.pictureUrl = "";
         update.statusMessage = "";
-        update.searchTokens = [];
       }
     }
   }
-  // merge:true 不覆蓋既有後結綁定欄位
+
+  // New users are indexed on their first event; existing users with missing or
+  // outdated tokens are repaired when they interact, with no collection scan.
+  const tokens = searchTokens([
+    displayName,
+    old.adminAlias || "",
+    old.boundCustomerCode || "",
+    old.boundCustomerName || "",
+  ]);
+  const previousTokens = Array.isArray(old.searchTokens) ? old.searchTokens : [];
+  if (!Array.isArray(old.searchTokens) || JSON.stringify(previousTokens) !== JSON.stringify(tokens)) {
+    update.searchTokens = tokens;
+  }
+
+  // merge:true preserves existing binding information and account balances.
   await ref.set(update, { merge: true });
   return "stored";
 }
@@ -180,7 +200,6 @@ export async function POST(request: NextRequest) {
     const body = JSON.parse(bodyText) as LineBody;
     const events = Array.isArray(body.events) ? body.events : [];
     let stored = 0;
-    // 順序處理，減少同一 UID 的並行覆蓋
     for (const event of events) {
       if ((await processEvent(event)) === "stored") stored++;
     }
