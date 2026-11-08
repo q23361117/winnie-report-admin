@@ -6,6 +6,9 @@ import {
   collection,
   doc,
   getDocs,
+  query,
+  orderBy,
+  limit,
   runTransaction,
   serverTimestamp,
   Timestamp,
@@ -122,9 +125,7 @@ export default function PointsPage() {
     setErrorMessage("");
 
     try {
-      const snapshot = await getDocs(
-        collection(db, "pointTransactions")
-      );
+      const snapshot = await getDocs(query(collection(db, "pointTransactions"), orderBy("createdAt", "desc"), limit(100))) /* POINTS_READ_LIMIT_V1 */;
 
       const result: PointRecord[] = snapshot.docs.map(
         (recordDocument) => {
@@ -678,8 +679,8 @@ export default function PointsPage() {
 
   useEffect(() => {
     void loadRecords();
-    void loadMembers();
-  }, [loadRecords, loadMembers]);
+
+  }, [loadRecords]);
 
   const filteredRecords = useMemo(() => {
     const keyword = searchText
@@ -758,14 +759,14 @@ export default function PointsPage() {
                 </h1>
 
                 <p className="mt-2 text-sm text-slate-500">
-                  查看報表自動集點、撤回紀錄與乘車金兌換狀況。
+                  查看最新 100 筆集點交易；本頁統計僅計入已載入紀錄，非歷史總計。
                 </p>
               </div>
 
               <div className="flex flex-wrap gap-3">
                 <button
                   type="button"
-                  onClick={() => setShowAdjustmentModal(true)}
+                  onClick={() => { setShowAdjustmentModal(true); void loadMembers(); }}
                   className="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
                 >
                   ＋ 新增調整紀錄
