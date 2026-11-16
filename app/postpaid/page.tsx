@@ -29,6 +29,7 @@ const menuItems = [
   { name: "會員管理", href: "/members" },
   { name: "集點紀錄", href: "/points" },
   { name: "後結帳務", href: "/postpaid" },
+  { name: "一鍵報表對帳", href: "/postpaid/reconcile" },
   { name: "乘車金管理", href: "/credits" },
 ];
 
@@ -507,6 +508,13 @@ export default function PostpaidPage() {
               </div>
 
               <div className="flex flex-col gap-3 sm:flex-row">
+
+                <Link
+                  href="/postpaid/reconcile"
+                  className="inline-flex items-center justify-center rounded-xl bg-violet-600 px-5 py-3 text-sm font-bold text-white shadow-lg transition hover:bg-violet-700"
+                >
+                  📋 一鍵報表對帳
+                </Link>
 
                 <Link
                   href="/postpaid/bind-line"
