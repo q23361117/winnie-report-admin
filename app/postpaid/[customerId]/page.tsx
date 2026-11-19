@@ -36,13 +36,16 @@ type TransactionRecord = {
   id: string;
   type: string;
   status: string;
-  amount: number;
-  previousBalance: number;
-  newBalance: number;
+  amount: number | null;
+  previousBalance: number | null;
+  newBalance: number | null;
   reason: string;
   rideDate: string;
   orderContent: string;
   source: string;
+  chargeAmount?: number | null;
+  paymentAmount?: number | null;
+  customerCode?: string;
   createdAt?: Timestamp;
 };
 
@@ -70,6 +73,7 @@ function getTypeLabel(type: string) {
     deposit: "儲值入帳",
     adjustment: "手動調整",
     reversal: "帳務撤回",
+    manual_reconciliation_adjustment: "人工對帳更正",
   };
 
   return labels[type] ?? type;
@@ -103,6 +107,10 @@ export default function PostpaidCustomerDetailPage() {
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState("");
+  const [historyWarning, setHistoryWarning] = useState("");
+  const [historyRefresh, setHistoryRefresh] = useState(0);
   const [editCustomerCode, setEditCustomerCode] = useState("");
   const [editName, setEditName] = useState("");
   const [editPhone, setEditPhone] = useState("");
@@ -167,49 +175,37 @@ export default function PostpaidCustomerDetailPage() {
   }, [customerId]);
 
   useEffect(() => {
-    if (!customer?.customerCode) return;
-
-    const transactionsQuery = query(
-      collection(db, "postpaidTransactions"),
-      where("customerCode", "==", customer.customerCode)
-    );
-
-    const unsubscribeTransactions = onSnapshot(
-      transactionsQuery,
-      (snapshot) => {
-        const rows = snapshot.docs.map((document) => {
-          const data = document.data();
-
-          return {
-            id: document.id,
-            type: String(data.type ?? ""),
-            status: String(data.status ?? "active"),
-            amount: Number(data.amount ?? 0),
-            previousBalance: Number(data.previousBalance ?? 0),
-            newBalance: Number(data.newBalance ?? 0),
-            reason: String(data.reason ?? ""),
-            rideDate: String(data.rideDate ?? ""),
-            orderContent: String(data.orderContent ?? ""),
-            source: String(data.source ?? ""),
-            createdAt:
-              data.createdAt instanceof Timestamp
-                ? data.createdAt
-                : undefined,
-          } satisfies TransactionRecord;
+    if (!customerId || !customer?.customerCode) return;
+    const controller = new AbortController();
+    setHistoryLoading(true);
+    setHistoryError("");
+    setHistoryWarning("");
+    setTransactions([]);
+    async function loadHistory() {
+      try {
+        const response = await fetch(`/api/postpaid/history?customerId=${encodeURIComponent(customerId)}`, {
+          cache: "no-store", signal: controller.signal,
         });
-
-        rows.sort((a, b) => {
-          const aTime = a.createdAt?.toMillis() ?? 0;
-          const bTime = b.createdAt?.toMillis() ?? 0;
-          return bTime - aTime;
-        });
-
+        const result = await response.json();
+        if (!response.ok || !result.success || !Array.isArray(result.transactions)) {
+          throw new Error(result.error || "讀取帳務明細失敗");
+        }
+        if (controller.signal.aborted) return;
+        const rows: TransactionRecord[] = result.transactions.map((record: Omit<TransactionRecord, "createdAt"> & { createdAtMs?: number | null }) => ({
+          ...record,
+          createdAt: typeof record.createdAtMs === "number" ? Timestamp.fromMillis(record.createdAtMs) : undefined,
+        }));
         setTransactions(rows);
+        setHistoryWarning(String(result.warning || ""));
+      } catch (err) {
+        if (!controller.signal.aborted) setHistoryError(err instanceof Error ? err.message : "讀取帳務明細失敗");
+      } finally {
+        if (!controller.signal.aborted) setHistoryLoading(false);
       }
-    );
-
-    return unsubscribeTransactions;
-  }, [customer?.customerCode]);
+    }
+    void loadHistory();
+    return () => controller.abort();
+  }, [customerId, customer?.customerCode, historyRefresh]);
 
   const activeTransactions = useMemo(
     () =>
@@ -435,6 +431,7 @@ export default function PostpaidCustomerDetailPage() {
       setAdjustmentAmount("");
       setAdjustmentReason("");
       setMessage("帳務調整已完成。");
+      setHistoryRefresh((n) => n + 1);
     } catch (adjustmentError) {
       console.error(adjustmentError);
       setError(
@@ -692,10 +689,15 @@ export default function PostpaidCustomerDetailPage() {
 
         <section className="mt-5 rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200/70">
           <div>
-            <h2 className="text-xl font-bold">帳務明細</h2>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-xl font-bold">帳務明細</h2>
+              <button type="button" disabled={historyLoading} onClick={() => setHistoryRefresh(n => n + 1)} className="rounded-xl border border-blue-200 px-4 py-2 text-sm font-bold text-blue-700 disabled:opacity-50">{historyLoading ? "讀取中…" : "重新讀取帳務"}</button>
+            </div>
             <p className="mt-1 text-sm text-slate-500">
-              目前共有 {activeTransactions.length} 筆有效帳務紀錄。
+              {historyLoading ? "正在讀取歷史帳本…" : historyError ? "查詢未完成" : `本次共讀取 ${activeTransactions.length} 筆未撤回紀錄（含人工更正），不是搭乘次數。`}
             </p>
+            {historyError && <p className="mt-3 rounded bg-red-50 p-3 text-sm text-red-700">{historyError}</p>}
+            {historyWarning && <p className="mt-3 rounded bg-amber-50 p-3 text-sm text-amber-800">{historyWarning}</p>}
           </div>
 
           <div className="mt-6 overflow-x-auto">
@@ -719,7 +721,7 @@ export default function PostpaidCustomerDetailPage() {
                       colSpan={7}
                       className="px-3 py-12 text-center text-sm text-slate-500"
                     >
-                      尚無帳務紀錄
+                      {historyLoading ? "讀取中…" : historyError ? "讀取失敗，請重新讀取" : "本次查詢未找到帳務紀錄"}
                     </td>
                   </tr>
                 ) : (
@@ -733,21 +735,25 @@ export default function PostpaidCustomerDetailPage() {
                       </td>
                       <td className="px-3 py-5 font-bold">
                         {getTypeLabel(record.type)}
+                        {record.customerCode && <p className="mt-1 text-xs text-slate-400">代號：{record.customerCode}</p>}
+                        {record.source && <p className="mt-1 text-xs text-slate-400">{record.source}</p>}
+                        <p className="mt-1 break-all text-xs text-slate-400" title={record.id}>{record.id}</p>
                       </td>
                       <td
                         className={`px-3 py-5 font-bold ${
-                          record.amount < 0
+                          (record.amount ?? 0) < 0
                             ? "text-red-600"
                             : "text-emerald-600"
                         }`}
                       >
-                        {formatMoney(record.amount)}
+                        {record.amount === null ? "—" : formatMoney(record.amount)}
+                        {(record.chargeAmount != null || record.paymentAmount != null) && <p className="mt-1 text-xs font-normal text-slate-500">後結 {record.chargeAmount == null ? "—" : formatMoney(record.chargeAmount)} ／ 收款 {record.paymentAmount == null ? "—" : formatMoney(record.paymentAmount)}</p>}
                       </td>
                       <td className="px-3 py-5">
-                        {formatMoney(record.previousBalance)}
+                        {record.previousBalance === null ? "—" : formatMoney(record.previousBalance)}
                       </td>
                       <td className="px-3 py-5">
-                        {formatMoney(record.newBalance)}
+                        {record.newBalance === null ? "—" : formatMoney(record.newBalance)}
                       </td>
                       <td className="px-3 py-5">
                         <p>{record.orderContent || record.reason || "—"}</p>
