@@ -164,6 +164,14 @@ export default function MembersPage() {
             </Link>
 
             <Link
+              href="/members/reconcile"
+              prefetch={false}
+              className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
+            >
+              ▤　會員一鍵對帳
+            </Link>
+            
+                        <Link
               href="/credits"
               className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
             >
@@ -185,7 +193,14 @@ export default function MembersPage() {
                 </p>
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <Link
+                  href="/members/reconcile"
+                  prefetch={false}
+                  className="inline-flex items-center justify-center rounded-xl bg-violet-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-700"
+                >
+                  會員一鍵對帳
+                </Link>
                 <button
                   type="button"
                   onClick={() => void loadMembers()}

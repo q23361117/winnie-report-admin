@@ -764,6 +764,13 @@ export default function PointsPage() {
               </div>
 
               <div className="flex flex-wrap gap-3">
+                <Link
+                  href="/members/reconcile"
+                  prefetch={false}
+                  className="inline-flex items-center justify-center rounded-xl bg-violet-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-700"
+                >
+                  會員一鍵對帳
+                </Link>
                 <button
                   type="button"
                   onClick={() => { setShowAdjustmentModal(true); void loadMembers(); }}
@@ -1463,6 +1470,14 @@ function Sidebar() {
         </Link>
 
         <Link
+          href="/members/reconcile"
+          prefetch={false}
+          className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
+        >
+          ▤　會員一鍵對帳
+        </Link>
+        
+                <Link
           href="/credits"
           className="block rounded-xl px-4 py-3 text-sm font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
         >
