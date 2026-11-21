@@ -82,9 +82,13 @@ function dateOf(value: unknown, month: string) {
   const d = `${y}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
   return d.startsWith(month+'-') && Number(m[3]) >= 1 && Number(m[3]) <= 31 ? d : '';
 }
-type Ride = { code:string; date:string; sheet:string; row:number; order:string; plate:string; fare:number };
+export type Ride = { cancelColumnKnown:boolean; spreadsheetId:string; sheetId:string; code:string; date:string; sheet:string; row:number; order:string; plate:string; fare:number };
 type Ledger = { id:string; date:string; order:string; plate:string; points:number; status:string; source:string; type:string; sheet:string; row:number };
 async function readRides(month:ReportMonth, token:string, warnings:string[]) {
+  const meta=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REPORTS[month]}?fields=sheets(properties(sheetId,title))`,{headers:{Authorization:`Bearer ${token}`},cache:'no-store',signal:AbortSignal.timeout(15000)});
+  if(!meta.ok) throw new Error(`${month} 無法讀取分頁識別碼`);
+  const metadata=await meta.json() as {sheets?: {properties:{sheetId:number;title:string}}[]};
+  const ids=new Map((metadata.sheets||[]).map(s=>[s.properties.title,String(s.properties.sheetId)]));
   const params=new URLSearchParams({valueRenderOption:'FORMATTED_VALUE'});
   for(const tab of SCANNABLE_TABS) params.append('ranges',`${sheetNameA1(tab)}!A1:R${MAX_WORKSHEET_ROWS}`);
   const res=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${REPORTS[month]}/values:batchGet?${params}`,{headers:{Authorization:`Bearer ${token}`},cache:'no-store',signal:AbortSignal.timeout(40000)});
@@ -101,10 +105,13 @@ async function readRides(month:ReportMonth, token:string, warnings:string[]) {
     rows.slice(2).forEach((r,j)=>{
       const code=member(r[c]), order=text(r[o]), date=dateOf(r[d],month), fare=money(r[f])+money(r[a]);
       if(!code||!order||!date||fare<=0||money(r[x])>0||/取消|作廢|未搭乘|空趟|儲值|收款/.test(order)) return;
-      rides.push({code,date,sheet,row:j+3,order,plate:text(r[p]),fare});
+      rides.push({cancelColumnKnown:x>=0,spreadsheetId:REPORTS[month],sheetId:ids.get(sheet)??"",code,date,sheet,row:j+3,order,plate:text(r[p]),fare});
     });
   });return rides;
 }
+export function rideKey(r:Ride){return crypto.createHash('sha256').update(JSON.stringify([r.spreadsheetId,r.sheetId,r.code,r.date,norm(r.order),norm(r.plate)])).digest('hex').slice(0,40);}
+// Restrict writes to the verified primary report layout; other tabs remain read-only.
+function xSafe(r:Ride){return r.sheet==='⚖️維尼'&&r.cancelColumnKnown&&!/跑腿|代購|代駕|送貨/.test(r.order);}
 export async function reconcileMembers(months:ReportMonth[]){
   const warnings:string[]=[];const token=await sheetsToken();
   const rides=(await Promise.all(months.map(m=>readRides(m,token,warnings)))).flat();
@@ -122,7 +129,7 @@ export async function reconcileMembers(months:ReportMonth[]){
       else {
         const q=await adminDb.collection('pointTransactions').where('memberCode','==',code).limit(MAX_TRANSACTION_ROWS_PER_CODE+1).get();
         reads+=Math.max(1,q.size); incomplete=q.size>MAX_TRANSACTION_ROWS_PER_CODE;
-        q.docs.forEach(doc=>{const v=doc.data();ledger.push({id:doc.id,date:text(v.rideDate),order:text(v.orderContent),plate:text(v.plate),points:Number(v.points||0),status:text(v.status),source:text(v.source),type:text(v.type),sheet:text(v.sheetName),row:Number(v.sheetRow||0)});});
+        q.docs.forEach(doc=>{const v=doc.data();ledger.push({id:doc.id,date:text(v.rideDate),order:text(v.orderContent),plate:text(v.plate),points:Number(v.points||0),status:text(v.status)||'active',source:text(v.source),type:text(v.type),sheet:text(v.sheetName),row:Number(v.sheetRow||0)});});
       }
     }
     const active=ledger.filter(t=>t.status==='active'&&t.source==='google_sheets_report'&&t.type==='earn'&&t.points===1);
@@ -131,7 +138,7 @@ export async function reconcileMembers(months:ReportMonth[]){
       const day=ledger.filter(t=>t.date===r.date), strong=active.filter(t=>t.date===r.date&&norm(t.order)===norm(r.order)&&!!r.plate&&norm(t.plate)===norm(r.plate));
       const repeated=rows.filter(x=>key(x)===key(r)).length>1;
       const status=incomplete?'查詢不完整':!profile?'無會員主檔':repeated||strong.length>1?'疑似重複／需核對':strong.length===1?'強配對（待確認）':day.length?'同日紀錄待核對':'疑似漏點';
-      return {...r,status,candidates:day.map(t=>({...t,strong:strong.some(x=>x.id===t.id)}))};
+      return {...r,key:rideKey(r),repairable:status==='疑似漏點'&&r.date<'2026-11-20'&&!!r.plate&&!!r.sheetId&&xSafe(r),status,candidates:day.map(t=>({...t,strong:strong.some(x=>x.id===t.id)}))};
     });
     accounts.push({code,name:text(profile?.name),points:profile?Number(profile.points??0):null,rideCredit:profile?Number(profile.rideCredit??0):null,totalRides:profile?Number(profile.totalRides??0):null,reportCount:rows.length,ledgerCount:rows.length?active.filter(t=>months.some(m=>t.date.startsWith(m+'-'))).length:null,missing:matches.filter(r=>r.status==='疑似漏點').length,incomplete,rows:matches});
   }
