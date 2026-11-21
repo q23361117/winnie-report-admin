@@ -224,161 +224,43 @@ export default function CreditsPage() {
   }, [loadData]);
 
   const adjustCredit = useCallback(
-    async (
-      member: Member,
-      mode: "add" | "use"
-    ) => {
-      const actionName =
-        mode === "add" ? "增加" : "扣除";
-
-      const amountInput = window.prompt(
-        `請輸入要${actionName}的乘車金金額：`,
-        mode === "add" ? "60" : ""
-      );
-
-      if (amountInput === null) {
+    async (member: Member, mode: "add" | "use") => {
+      const actionName = mode === "add" ? "增加" : "使用";
+      const raw = window.prompt(`請輸入要${actionName}的乘車金：`, mode === "add" ? "60" : "");
+      if (raw === null) return;
+      const amount = Number(raw);
+      if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 100000) {
+        window.alert("請輸入 1 至 100000 的整數金額");
         return;
       }
-
-      const amount = Math.floor(
-        Number(amountInput)
-      );
-
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0
-      ) {
-        window.alert(
-          "請輸入大於 0 的整數金額。"
-        );
+      const reason = window.prompt("請輸入至少12字的核對原因：", "")?.trim();
+      if (reason === undefined) return;
+      if (reason.length < 12) {
+        window.alert("核對原因至少要有12個字");
         return;
       }
-
-      const reasonInput = window.prompt(
-        "請輸入操作原因：",
-        mode === "add"
-          ? "後台手動增加乘車金"
-          : "會員搭乘使用乘車金"
-      );
-
-      if (reasonInput === null) {
-        return;
-      }
-
-      const reason =
-        reasonInput.trim() ||
-        (mode === "add"
-          ? "後台手動增加乘車金"
-          : "會員搭乘使用乘車金");
-
-      const confirmed = window.confirm(
-        `確定要為 ${member.memberCode}｜${member.name || "未填姓名"} ${actionName} ${formatMoney(amount)} 嗎？\n\n目前餘額：${formatMoney(member.rideCredit)}\n原因：${reason}`
-      );
-
-      if (!confirmed) {
-        return;
-      }
-
+      const expectedBalance = member.rideCredit;
+      if (!window.confirm(`確定${actionName} ${member.memberCode} 的乘車金 $${amount}？\n目前餘額 $${expectedBalance}\n原因：${reason}\n這不會修改後結帳務。`)) return;
       setOperatingCode(member.memberCode);
       setErrorMessage("");
-
       try {
-        const memberRef = doc(
-          db,
-          "members",
-          member.memberCode
-        );
-
-        const recordRef = doc(
-          collection(
-            db,
-            "rideCreditTransactions"
-          )
-        );
-
-        await runTransaction(
-          db,
-          async (transaction) => {
-            const memberSnapshot =
-              await transaction.get(memberRef);
-
-            if (!memberSnapshot.exists()) {
-              throw new Error(
-                `找不到會員 ${member.memberCode}`
-              );
-            }
-
-            const memberData =
-              memberSnapshot.data();
-
-            const currentBalance = Math.max(
-              0,
-              Number(
-                memberData.rideCredit ?? 0
-              )
-            );
-
-            if (
-              mode === "use" &&
-              currentBalance < amount
-            ) {
-              throw new Error(
-                `乘車金不足，目前只有 ${formatMoney(currentBalance)}`
-              );
-            }
-
-            const signedAmount =
-              mode === "add"
-                ? amount
-                : -amount;
-
-            const newBalance =
-              currentBalance +
-              signedAmount;
-
-            transaction.update(memberRef, {
-              rideCredit: newBalance,
-              updatedAt: serverTimestamp(),
-            });
-
-            transaction.set(recordRef, {
-              transactionId: recordRef.id,
-              memberCode:
-                member.memberCode,
-              memberName:
-                member.name || "",
-              amount: signedAmount,
-              type:
-                mode === "add"
-                  ? "manual_add"
-                  : "use",
-              status: "active",
-              reason,
-              source: "admin_dashboard",
-              balanceBefore:
-                currentBalance,
-              balanceAfter: newBalance,
-              createdAt: serverTimestamp(),
-            });
-          }
-        );
-
-        window.alert(
-          `乘車金已成功${actionName}。`
-        );
-
+        const operationId = crypto.randomUUID();
+        const response = await fetch("/api/credits/adjust", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({
+            memberCode: member.memberCode,
+            mode, amount, expectedBalance, reason, operationId,
+            confirmation: `確認${actionName}${member.memberCode}`,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.success) throw new Error(payload.error || "調整失敗");
+        window.alert(`乘車金調整成功：$${payload.before} → $${payload.after}`);
         await loadData();
       } catch (error) {
-        console.error(
-          "調整乘車金失敗：",
-          error
-        );
-
-        const message =
-          error instanceof Error
-            ? error.message
-            : "調整乘車金失敗";
-
+        const message = error instanceof Error ? error.message : "調整失敗";
         setErrorMessage(message);
         window.alert(message);
       } finally {
