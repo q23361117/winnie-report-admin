@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import CorrectionV2 from "./CorrectionV2";
+import CorrectionV3 from "./CorrectionV3";
 import { useState } from "react";
 
 type Account = {
@@ -67,8 +67,8 @@ export default function NotifyPostpaidPage() {
     <div className="mx-auto max-w-6xl space-y-6">
       <header className="flex items-center justify-between gap-4">
         <div><p className="text-sm font-bold text-blue-600">後結帳務管理</p>
-          <h1 className="mt-1 text-2xl font-bold">對帳結果 LINE 通知中心 V2</h1>
-          <p className="mt-2 text-sm text-slate-600">先核對帳本與漏帳；0059 可補登已確認的 11/20 兩筆，其他客戶不變。補登後再單筆發送 LINE。</p></div>
+          <h1 className="mt-1 text-2xl font-bold">對帳結果 LINE 通知中心 V3</h1>
+          <p className="mt-2 text-sm text-slate-600">先逐筆核對報表與帳本，再確認補登並單筆通知客戶；補登與 LINE 推播是獨立操作。</p></div>
         <Link href="/postpaid/reconcile" className="rounded-lg border bg-white px-4 py-2 text-sm">回一鍵對帳</Link>
       </header>
       <section className="rounded-xl border bg-white p-5">
@@ -97,8 +97,8 @@ export default function NotifyPostpaidPage() {
         </tr>)}</tbody></table></div>
       </section>}
       {preview && <section className="rounded-xl border-2 border-amber-300 bg-white p-5">
-        <h2 className="font-bold">3. 人工確認並發送：{preview.customerCode} {preview.customerName}</h2>
-        <CorrectionV2 code={preview.customerCode} currentBalance={preview.currentBalance} onCorrected={() => choose(preview.customerCode)} />
+        <h2 className="font-bold">3. 逐筆核對、補登及通知：{preview.customerCode} {preview.customerName}</h2>
+        <CorrectionV3 code={preview.customerCode} currentBalance={preview.currentBalance} months={months} onCorrected={() => choose(preview.customerCode)} />
         <p className="mt-2 text-sm">目前餘額：<strong>NT${preview.currentBalance.toLocaleString("zh-TW")}</strong></p>
         {preview.priorStatus !== "not_sent" && <p className="mt-2 rounded bg-red-50 p-3 text-sm font-semibold text-red-700">
           已有相同餘額的通知紀錄：{preview.priorStatus}。為避免重複發送，本版不允許再次推送。</p>}
