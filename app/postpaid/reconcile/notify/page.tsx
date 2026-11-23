@@ -69,6 +69,7 @@ export default function NotifyPostpaidPage() {
         <div><p className="text-sm font-bold text-blue-600">後結帳務管理</p>
           <h1 className="mt-1 text-2xl font-bold">對帳結果 LINE 通知中心 V3</h1>
           <p className="mt-2 text-sm text-slate-600">先逐筆核對報表與帳本，再確認補登並單筆通知客戶；補登與 LINE 推播是獨立操作。</p></div>
+        <Link href="/postpaid/reconcile/batch" className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white">V4 全客戶批次對帳</Link>
         <Link href="/postpaid/reconcile" className="rounded-lg border bg-white px-4 py-2 text-sm">回一鍵對帳</Link>
       </header>
       <section className="rounded-xl border bg-white p-5">
