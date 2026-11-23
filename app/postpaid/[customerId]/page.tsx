@@ -379,54 +379,31 @@ export default function PostpaidCustomerDetailPage() {
     setMessage("");
 
     try {
-      const customerRef = doc(db, "postpaidCustomers", customerId);
-      const transactionRef = doc(collection(db, "postpaidTransactions"));
-
-      await runTransaction(db, async (transaction) => {
-        const customerSnapshot = await transaction.get(customerRef);
-
-        if (!customerSnapshot.exists()) {
-          throw new Error("找不到後結客戶。");
-        }
-
-        const currentData = customerSnapshot.data();
-        const previousBalance = Number(currentData.balance ?? 0);
-
-        const delta =
-          adjustmentType === "payment" ||
-          adjustmentType === "deposit"
-            ? amount
-            : -amount;
-
-        const newBalance = previousBalance + delta;
-
-        transaction.update(customerRef, {
-          balance: newBalance,
-          updatedAt: serverTimestamp(),
-        });
-
-        transaction.set(transactionRef, {
-          transactionId: transactionRef.id,
+      const reason = adjustmentReason.trim();
+      if (reason.length < 12) throw new Error("請填寫至少12字的原因，包含收款日期與方式，避免重複記帳。");
+      if (!Number.isSafeInteger(amount)) throw new Error("金額需為整數。");
+      const response = await fetch("/api/postpaid/manual-payment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          customerId,
           customerCode: customer.customerCode,
-          customerName: customer.name,
-          amount: delta,
-          inputAmount: amount,
-          previousBalance,
-          newBalance,
           type: adjustmentType,
-          status: "active",
-          reason:
-            adjustmentReason.trim() ||
-            (adjustmentType === "payment"
-              ? "後台收款入帳"
-              : adjustmentType === "deposit"
-                ? "後台儲值入帳"
-                : "後台手動扣款"),
-          source: "admin_manual",
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+          amount,
+          expectedBalance: customer.balance,
+          reason,
+        }),
       });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || "後端入帳失敗，請先查帳，不要重複送出。");
+      }
+      if (result.duplicated) {
+        setMessage("這筆相同來源的帳務已入帳，本次沒有重複寫入。請重新讀取帳務確認。");
+        setHistoryRefresh((n) => n + 1);
+        return;
+      }
 
       setAdjustmentAmount("");
       setAdjustmentReason("");
