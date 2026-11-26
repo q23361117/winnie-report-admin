@@ -17,16 +17,97 @@ function codeOf(value: unknown) {
 function customerIdOf(code: string) {
   return createHash("sha256").update(code, "utf8").digest("hex").slice(0, 40);
 }
-function notificationId(customerId: string, balance: number, adjustmentId: string) {
-  return createHash("sha256").update(`reconcile-notice-v1:${customerId}:${balance}:${adjustmentId}`).digest("hex");
+function sha(value: string) { return createHash("sha256").update(value).digest("hex"); }
+function legacyNotificationId(customerId: string, balance: number, adjustmentId: string) {
+  return sha(`reconcile-notice-v1:${customerId}:${balance}:${adjustmentId}`);
 }
 const formatMoney = (value: number) => `NT$${value.toLocaleString("zh-TW")}`;
+const signedMoney = (value: number) => `${value > 0 ? "+" : ""}${formatMoney(value)}`;
 
+type LedgerItem = {
+  id: string; before: number; after: number; delta: number;
+  type: string; summary: string; createdAtMs: number;
+};
+type NoticeItem = {
+  id: string; balance: number; status: string; createdAtMs: number;
+};
 type CustomerSnapshot = {
   customerId: string; code: string; name: string; balance: number; lineUserId: string;
   adjustmentId: string; previousBalance: number | null; changeAmount: number | null;
   noticeId: string; message: string;
+  ledgerIds: string[];
 };
+function getTimeMs(value: unknown): number {
+  if (!value || typeof value !== "object") return 0;
+  const data = value as { toMillis?: () => number; seconds?: number };
+  if (typeof data.toMillis === "function") return data.toMillis();
+  return typeof data.seconds === "number" ? data.seconds * 1000 : 0;
+}
+function summaryOf(data: Record<string, unknown>): string {
+  const type = String(data.type ?? "");
+  const source = String(data.source ?? "");
+  const label = type === "payment" ? "收款入帳" : type === "deposit" ? "儲值入帳" :
+    type === "adjustment" ? "手動扣款" :
+    source === "google_sheets_report" ? (Number(data.paymentAmount || 0) > 0 ? "報表收款" : "後結車資") : "帳務調整";
+  const reason = String(data.reason ?? data.orderContent ?? data.plate ?? "").replace(/\s+/g, " ").trim().slice(0, 110);
+  return reason ? `${label}（${reason}）` : label;
+}
+
+/**
+ * 只在「有前次已受理通知」且「其後的完整交易鏈可以從前餘額接到目前餘額」時展示明細。
+ * 無法證實完整，不使用月報差額或隨意加總交易來杜撰更正金額。
+ * 只讀取，不會寫帳、補扣或修改點數。
+ */
+async function verifiedChanges(customerId: string, balance: number): Promise<{
+  chain: { before: number; items: LedgerItem[]; latestId: string } | null;
+  priorSameBalanceNoticeId: string | null;
+}> {
+  const [ledgerSnap, noticeSnap] = await Promise.all([
+    adminDb.collection("postpaidTransactions").where("customerId", "==", customerId).limit(250).get(),
+    adminDb.collection("postpaidReconcileNotices").where("customerId", "==", customerId).limit(150).get(),
+  ]);
+  // 查詢達上限，可能遺漏交易；保守降級成餘額通知。
+  if (ledgerSnap.size >= 250 || noticeSnap.size >= 150) return { chain: null, priorSameBalanceNoticeId: null };
+  const notices: NoticeItem[] = noticeSnap.docs.map(doc => {
+    const d = doc.data();
+    return { id: doc.id, balance: Number(d.balance), status: String(d.status ?? ""), createdAtMs: getTimeMs(d.createdAt) };
+  }).filter(n => (n.status === "accepted" || n.status === "sending" || n.status === "unknown") && Number.isSafeInteger(n.balance) && n.createdAtMs > 0)
+    .sort((a, b) => b.createdAtMs - a.createdAtMs);
+  if (!notices.length) return { chain: null, priorSameBalanceNoticeId: null };
+  const anchor = notices[0];
+  if (anchor.balance === balance) return { chain: null, priorSameBalanceNoticeId: anchor.id };
+
+  const items: LedgerItem[] = ledgerSnap.docs.flatMap(doc => {
+    const d = doc.data();
+    if (d.status === "reversed" || d.status === "void") return [];
+    const before = Number(d.previousBalance);
+    const after = Number(d.newBalance);
+    const timestamp = getTimeMs(d.createdAt);
+    if (!Number.isSafeInteger(before) || !Number.isSafeInteger(after) || !timestamp || timestamp < anchor.createdAtMs) return [];
+    const delta = after - before;
+    if (!Number.isSafeInteger(delta) || delta === 0) return [];
+    const amount = Number(d.amount);
+    if (Number.isSafeInteger(amount) && amount !== delta) return [];
+    return [{ id: doc.id, before, after, delta, type: String(d.type ?? ""), summary: summaryOf(d), createdAtMs: timestamp }];
+  }).sort((a, b) => b.createdAtMs - a.createdAtMs || b.id.localeCompare(a.id));
+
+  const chain: LedgerItem[] = [];
+  let expected = balance;
+  let upperTime = Number.POSITIVE_INFINITY;
+  // 由目前餘額往回推，只接受唯一的連續餘額鏈。
+  for (let i = 0; i < 20 && expected !== anchor.balance; i++) {
+    const matched = items.filter(t => t.after === expected && t.createdAtMs <= upperTime && !chain.some(c => c.id === t.id));
+    if (matched.length !== 1) return { chain: null, priorSameBalanceNoticeId: null };
+    const item = matched[0];
+    chain.push(item);
+    expected = item.before;
+    upperTime = item.createdAtMs;
+  }
+  if (expected !== anchor.balance || !chain.length) return { chain: null, priorSameBalanceNoticeId: null };
+  const ordered = chain.reverse();
+  if (ordered.reduce((sum, item) => sum + item.delta, anchor.balance) !== balance) return { chain: null, priorSameBalanceNoticeId: null };
+  return { chain: { before: anchor.balance, items: ordered, latestId: ordered[ordered.length - 1].id }, priorSameBalanceNoticeId: null };
+}
 
 async function readSnapshot(rawCode: unknown): Promise<CustomerSnapshot> {
   const code = codeOf(rawCode);
@@ -55,16 +136,34 @@ async function readSnapshot(rawCode: unknown): Promise<CustomerSnapshot> {
       changeAmount = a.delta;
     }
   }
-  const noticeId = notificationId(customerId, balance, previousBalance === null ? "balance-confirmation" : adjustmentId);
-  const header = previousBalance === null ? "📘【維尼車隊｜後結帳務核對結果】" : "📘【維尼車隊｜後結帳務更正通知】";
+  let chain: { before: number; items: LedgerItem[]; latestId: string } | null = null;
+  let priorSameBalanceNoticeId: string | null = null;
+  try {
+    const verification = await verifiedChanges(customerId, balance);
+    chain = verification.chain; priorSameBalanceNoticeId = verification.priorSameBalanceNoticeId;
+  }
+  catch (e) { console.warn("通知逐筆明細無法完整驗證，改只顯示最新餘額：", e instanceof Error ? e.message : String(e)); }
+
+  const ledgerIds = chain?.items.map(i => i.id) ?? [];
+  // 已有相同餘額的舊版通知時，仍沿用舊 ID，避免新版造成重發。
+  const legacyId = legacyNotificationId(customerId, balance, previousBalance === null ? "balance-confirmation" : adjustmentId);
+  const legacy = await adminDb.collection("postpaidReconcileNotices").doc(legacyId).get();
+  const noticeId = priorSameBalanceNoticeId || (legacy.exists ? legacyId : chain ? sha(`reconcile-notice-v2:${customerId}:${balance}:${ledgerIds.join("|")}`) : legacyId);
+  const header = chain || previousBalance !== null ? "📘【維尼車隊｜後結帳務更正通知】" : "📘【維尼車隊｜後結帳務核對結果】";
   const lines = [header, "", `👤 客戶代號：${code}`, `👤 客戶名稱：${name}`, "", "📋 經管理員逐筆核對，提供本次確認的後結餘額。", ""];
-  if (previousBalance !== null && changeAmount !== null) {
-    lines.push(`💰 更正前餘額：${formatMoney(previousBalance)}`, `🧾 本次調整：${changeAmount > 0 ? "+" : ""}${formatMoney(changeAmount)}`, `📊 更正後餘額：${formatMoney(balance)}`);
+  if (chain) {
+    lines.push(`💰 更正前餘額：${formatMoney(chain.before)}`, "", "📑 本次已登記交易：");
+    chain.items.forEach((item, idx) => lines.push(`${idx + 1}. ${item.summary}：${signedMoney(item.delta)}`));
+    lines.push("", `🧾 本次淨調整：${signedMoney(balance - chain.before)}`, `📊 更正後餘額：${formatMoney(balance)}`);
+  } else if (previousBalance !== null && changeAmount !== null) {
+    lines.push(`💰 更正前餘額：${formatMoney(previousBalance)}`, `🧾 本次調整：${signedMoney(changeAmount)}`, `📊 更正後餘額：${formatMoney(balance)}`);
   } else {
     lines.push(`📊 本次核對餘額：${formatMoney(balance)}`);
   }
   lines.push("", "負數代表尚欠車資；正數代表帳戶尚有餘額。", "此訊息為已核對帳務結果通知，不會另外扣款或新增搭乘紀錄。", "如與您的紀錄不同，請聯繫車隊客服協助核對。感謝您的理解與配合。");
-  return { customerId, code, name, balance, lineUserId, adjustmentId, previousBalance, changeAmount, noticeId, message: lines.join("\n") };
+  const message = lines.join("\n");
+  if (message.length > 4500) throw new Error("通知文字過長，請縮小待核對交易範圍");
+  return { customerId, code, name, balance, lineUserId, adjustmentId, previousBalance, changeAmount, noticeId, message, ledgerIds };
 }
 
 export async function POST(request: NextRequest) {
@@ -95,14 +194,13 @@ export async function POST(request: NextRequest) {
   if (process.env.WINNIE_RECONCILE_NOTIFY_ENABLED !== "true") return fail("通知功能未啟用，請設定 WINNIE_RECONCILE_NOTIFY_ENABLED=true", 423);
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
   if (!token) return fail("Vercel 缺少 LINE_CHANNEL_ACCESS_TOKEN", 423);
-  if (body.noticeId !== snapshot.noticeId) return fail("客戶餘額或核對狀態已改變，請重新預覽", 409);
+  if (body.noticeId !== snapshot.noticeId) return fail("客戶餘額或通知明細已改變，請重新預覽", 409);
   if (body.confirmation !== `確認通知${snapshot.code}`) return fail(`請輸入「確認通知${snapshot.code}」`, 400);
   if (body.confirmed !== true) return fail("請先勾選人工核對已完成", 400);
   const evidence = String(body.evidence ?? "").trim();
   if (evidence.length < 12 || evidence.length > 500) return fail("請填入 12～500 字人工核對依據", 400);
   try {
-    // 固定 ID + Firestore create：同一個已核對餘額只能進入一次發送流程。
-    await adminDb.runTransaction(async (tx) => {
+    await adminDb.runTransaction(async tx => {
       const customerRef = adminDb.collection("postpaidCustomers").doc(snapshot.customerId);
       const [customer, existing] = await Promise.all([tx.get(customerRef), tx.get(noticeRef)]);
       if (existing.exists) throw new Error("此餘額已有通知紀錄（包含發送狀態不明），禁止重複發送");
@@ -114,7 +212,7 @@ export async function POST(request: NextRequest) {
       }
       tx.create(noticeRef, {
         customerId: snapshot.customerId, customerCode: snapshot.code, balance: snapshot.balance,
-        adjustmentId: snapshot.adjustmentId, message: snapshot.message,
+        adjustmentId: snapshot.adjustmentId, ledgerIds: snapshot.ledgerIds, message: snapshot.message,
         evidence, actorUid: admin.uid, status: "sending", createdAt: FieldValue.serverTimestamp(),
       });
     });
@@ -127,7 +225,6 @@ export async function POST(request: NextRequest) {
       cache: "no-store", signal: AbortSignal.timeout(12000),
     });
     if (!response.ok) {
-      // 不自動重送。LINE 的拒絕／成功狀態須保留，避免帳務通知重複。
       const detail = (await response.text()).slice(0, 300);
       await noticeRef.update({ status: "rejected", lineHttpStatus: response.status, lineError: detail, updatedAt: FieldValue.serverTimestamp() });
       return fail(`LINE API 拒絕 (${response.status})，請查看 Vercel Logs；本筆不會自動重送`, 502);
